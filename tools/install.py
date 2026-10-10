@@ -152,8 +152,8 @@ def flash(image):
     adb('push', image, '/sdcard/ci_sos.img')
     out = root('B=/data/local/bin/busybox\n'
                'S=%s\n$B dd if=/sdcard/ci_sos.img of=$S bs=4096 2>&1 | $B tail -n 1\n$B sync\n'
-               'echo FLASHED=$($B dd if=$S bs=1 count=%d 2>/dev/null | $B sha256sum | $B cut -d" " -f1)\n'
-           % (SOS, n))
+               'echo FLASHED=$($B dd if=$S bs=4096 count=%d 2>/dev/null | $B head -c %d | $B sha256sum | $B cut -d" " -f1)\n'
+           % (SOS, (n + 4095) // 4096, n))
     got = re.search(r'FLASHED=([0-9a-f]{64})', out)
     if not got or got.group(1) != want:
         die('verification FAILED (wrote %s, read back %s). Run "restore" before rebooting anything.' % (want, got and got.group(1)))
