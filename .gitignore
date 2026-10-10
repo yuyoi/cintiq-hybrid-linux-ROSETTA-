@@ -1,0 +1,8 @@
+work/
+backups/
+*.img
+*.xwd
+__pycache__/
+*.pyc
+secret.txt
+*.log

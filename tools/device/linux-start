@@ -1,0 +1,15 @@
+#!/system/bin/sh
+# Enter the Alpine chroot from Android (run as root).  linux-start            -> shell
+#                                                      linux-start CMD...      -> run CMD
+BB=/data/local/bin/busybox
+R=/data/local/alpine
+$BB mountpoint -q $R/proc || $BB mount -t proc proc $R/proc
+$BB mountpoint -q $R/sys  || $BB mount -t sysfs sysfs $R/sys
+$BB mountpoint -q $R/dev  || $BB mount -o bind /dev $R/dev
+$BB mountpoint -q $R/dev/pts || $BB mount -t devpts devpts $R/dev/pts 2>/dev/null
+$BB mkdir -p $R/sdcard $R/tmp
+$BB mountpoint -q $R/sdcard || $BB mount -o bind /sdcard $R/sdcard
+echo 'nameserver 8.8.8.8' > $R/etc/resolv.conf
+echo 'nameserver 1.1.1.1' >> $R/etc/resolv.conf
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root TERM=${TERM:-xterm} LANG=C.UTF-8
+if [ $# -gt 0 ]; then exec $BB chroot $R /bin/sh -c "$*"; else exec $BB chroot $R /bin/sh -l; fi
