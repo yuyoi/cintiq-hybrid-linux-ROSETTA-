@@ -104,6 +104,15 @@ cat > $H/.config/openbox/menu.xml <<'EOF'
 <menu id="root-menu" label="ROSETTA // CINTIQ">
   <item label="Terminal"><action name="Execute"><command>xterm</command></action></item>
   <item label="Krita (paint)"><action name="Execute"><command>/root/krita.sh</command></action></item>
+  <item label="DOODLE DOOM (game)"><action name="Execute"><command>python3 /root/games/doodledoom.py</command></action></item>
+  <item label="Straight-to-Krita on/off"><action name="Execute"><command>/root/kiosk.sh toggle</command></action></item>
+  <item label="Arrange windows"><action name="Execute"><command>python3 /root/tile.py</command></action></item>
+  <menu id="rotate" label="Rotate screen">
+    <item label="Landscape"><action name="Execute"><command>/root/rotate.sh normal</command></action></item>
+    <item label="Portrait (right)"><action name="Execute"><command>/root/rotate.sh CW</command></action></item>
+    <item label="Portrait (left)"><action name="Execute"><command>/root/rotate.sh CCW</command></action></item>
+    <item label="Upside down"><action name="Execute"><command>/root/rotate.sh UD</command></action></item>
+  </menu>
   <item label="Files"><action name="Execute"><command>pcmanfm</command></action></item>
   <item label="Text editor"><action name="Execute"><command>mousepad</command></action></item>
   <item label="System monitor"><action name="Execute"><command>xterm -T monitor -e htop</command></action></item>
@@ -257,6 +266,15 @@ button_padding = 14 4
 button_background_id = 2
 
 button = new
+button_text = PC
+button_tooltip = Wireless Cintiq: show and pen-control the PC
+button_lclick_command = /root/pcmode.sh
+button_font = DejaVu Sans Bold 11
+button_font_color = #4fd05a 100
+button_padding = 16 4
+button_background_id = 2
+
+button = new
 button_text = CAL
 button_tooltip = Calibrate pen
 button_lclick_command = /root/calib.sh pen
@@ -307,7 +325,30 @@ button_font_color = #c8322a 100
 button_padding = 14 4
 button_background_id = 2
 
-panel_items = PPPPPPPPPPPPTSC
+button = new
+button_text = ROT
+button_tooltip = rotate the screen (desktop restarts, open apps close)
+button_lclick_command = /root/rotate.sh next
+button_font = DejaVu Sans Bold 10
+button_font_color = #7fd0ff 100
+button_padding = 14 4
+button_background_id = 2
+
+execp = new
+execp_command = /root/battery.sh
+execp_tooltip = Battery and brightness (wheel = dim, click = cycle)
+execp_interval = 30
+execp_continuous = 0
+execp_has_icon = 0
+execp_mwheel_up_command = /root/bright.sh up
+execp_mwheel_down_command = /root/bright.sh down
+execp_lclick_command = /root/bright.sh cycle
+execp_font = DejaVu Sans Bold 10
+execp_font_color = #f0b12a 100
+execp_padding = 14 4
+execp_background_id = 2
+
+panel_items = PPPPPPPPPPPPPPTSEC
 panel_size = 100% 48
 panel_margin = 0 0
 panel_padding = 0 0 0
@@ -390,8 +431,36 @@ cat > $H/keymap.txt <<'EOF'
 225 greater
 217 e
 139 b
-158 Escape
+158 pc_toggle
 EOF
+
+cat > $H/pcmode.sh <<'EOF'
+#!/bin/sh
+# Toggle PC mode: the PC's screen fills the panel (video straight into the framebuffer), the pen goes to the PC.
+# Config in /root/pc.conf:  host=<pc ip>  port=5600  secret=<hex>  video_port=5700
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin DISPLAY=${DISPLAY:-:0}
+[ -f /root/pc.conf ] && . /root/pc.conf
+if [ -f /tmp/pcmode ]; then
+  rm -f /tmp/pcmode
+  pkill -f 'ffmpeg.*fbdev' 2>/dev/null
+  rm -f /tmp/mirror.pause
+  [ -f /tmp/native-x ] && xinput enable pen
+else
+  [ -f /root/pc.conf ] || { echo "no /root/pc.conf" > /tmp/pcmode.err; exit 1; }
+  touch /tmp/pcmode /tmp/mirror.pause
+  echo 4194304 > /proc/sys/net/core/rmem_max 2>/dev/null     # let the video socket buffer Wi-Fi bursts
+  [ -f /tmp/native-x ] && xinput disable pen          # native X: the pen must only draw on the PC, not the hidden desktop
+  # the video has to match the framebuffer's byte order (native X uses RGBA, the Xvfb mirror BGRA)
+  FMT=$(python3 -c "import fcntl,struct;b=bytearray(160);fcntl.ioctl(open('/dev/graphics/fb0','rb'),0x4600,b);print('rgba' if struct.unpack('<40I',bytes(b))[8]==0 else 'bgra')")
+  ffmpeg -hide_banner -loglevel warning -fflags nobuffer -flags low_delay -probesize 64k -analyzeduration 0 \
+    -threads 4 -thread_type slice -thread_queue_size 2 -i "udp://0.0.0.0:${video_port:-5700}?fifo_size=20000&overrun_nonfatal=1&buffer_size=4194304" -an -filter_threads 4 \
+    -vf "scale=1920:1080:flags=fast_bilinear,format=${FMT:-rgba}" -fps_mode passthrough -f fbdev /dev/graphics/fb0 >/tmp/pcvideo.log 2>&1 &
+  # rescue: if the video player died, go straight back to the desktop instead of leaving the screen frozen
+  ( sleep 4; pgrep -f 'ffmpeg.*fbdev' >/dev/null || { rm -f /tmp/pcmode /tmp/mirror.pause; [ -f /tmp/native-x ] && xinput enable pen; echo "video failed: see /tmp/pcvideo.log" > /tmp/pcmode.err; } ) &
+fi
+EOF
+chmod +x $H/pcmode.sh
+[ -f $H/pc.conf ] || printf '# written by the PC side; see pc_remote/\nhost=CHANGE_ME\nport=5600\nsecret=CHANGE_ME\nvideo_port=5700\n' > $H/pc.conf
 
 cat > $H/calib.sh <<'EOF'
 #!/bin/sh
@@ -416,6 +485,62 @@ chmod +x $H/nudge.sh
 [ -f $H/offset_pen.txt ] || echo "0 0" > $H/offset_pen.txt
 [ -f $H/offset_touch.txt ] || echo "0 0" > $H/offset_touch.txt
 
+cat > $H/battery.sh <<'EOF'
+#!/bin/sh
+# One short line for the taskbar: "AC 95%" / "BAT 72%" / "BAT 12% LOW"
+P=/sys/class/power_supply
+C=$(cat $P/battery/capacity 2>/dev/null)
+S=$(cat $P/battery/status 2>/dev/null)
+A=$(cat $P/ac/online 2>/dev/null)
+case $C in ''|*[!0-9]*) C=? ;; esac
+if [ "$A" = "1" ] || [ "$S" = "Charging" ] || [ "$S" = "Full" ]; then
+  echo "AC ${C}%"
+elif [ "$C" != "?" ] && [ "$C" -lt 15 ]; then
+  echo "BAT ${C}% LOW"
+else
+  echo "BAT ${C}%"
+fi
+EOF
+chmod +x $H/battery.sh
+
+cat > $H/bright.sh <<'EOF'
+#!/bin/sh
+# usage: bright.sh up|down|cycle
+# step 25, clamped to 10..255; cycle goes 255 -> 128 -> 40 -> 255
+B=/sys/class/backlight/pwm-backlight/brightness
+S=/root/brightness.txt
+# the saved value wins over the live one, so idledim.py dimming (20) is ignored here
+cur=$(cat $S 2>/dev/null)
+[ -f $S ] || cur=$(cat $B 2>/dev/null)
+case $cur in ''|*[!0-9]*) cur=255 ;; esac
+case $1 in
+  up) n=$((cur+25)); [ $n -gt 255 ] && n=255 ;;
+  down) n=$((cur-25)); [ $n -lt 10 ] && n=10 ;;
+  cycle) if [ $cur -ge 240 ]; then n=128; elif [ $cur -ge 110 ]; then n=40; else n=255; fi ;;
+  *) n=$cur ;;
+esac
+[ $n -lt 10 ] && n=10
+[ $n -gt 255 ] && n=255
+echo $n > $B 2>/dev/null
+echo $n > $S
+EOF
+chmod +x $H/bright.sh
+
+cat > $H/kiosk.sh <<'EOF'
+#!/bin/sh
+# usage: kiosk.sh toggle|status
+# "Straight-to-Krita" mode: session.sh then boots wallpaper + openbox + tint2 + Krita only.
+F=/root/kiosk_krita
+case $1 in
+  toggle)
+    if [ -f $F ]; then rm -f $F; echo "Straight-to-Krita: off"
+    else touch $F; echo "Straight-to-Krita: on"; fi ;;
+  status) [ -f $F ] && echo "Straight-to-Krita: on" || echo "Straight-to-Krita: off" ;;
+  *) echo "usage: kiosk.sh toggle|status"; exit 1 ;;
+esac
+EOF
+chmod +x $H/kiosk.sh
+
 cat > $H/keys.sh <<'EOF'
 #!/bin/sh
 export HOME=/root GSETTINGS_BACKEND=memory NO_AT_BRIDGE=1 DISPLAY=${DISPLAY:-:0}
@@ -427,29 +552,198 @@ fi
 EOF
 chmod +x $H/keys.sh
 
+cat > $H/rotate.sh <<'EOF'
+#!/bin/sh
+# usage: rotate.sh next|normal|CW|UD|CCW - X can only rotate at start-up, so the desktop restarts (open apps close)
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+[ -f /tmp/native-x ] || { echo "rotation needs native X" > /tmp/rotate.err; exit 1; }
+cur=$(cat /root/rotation 2>/dev/null); [ -n "$cur" ] || cur=normal
+case "$1" in
+  normal|CW|UD|CCW) new=$1 ;;
+  *) case "$cur" in normal) new=CW ;; CW) new=UD ;; UD) new=CCW ;; *) new=normal ;; esac ;;
+esac
+[ "$new" = "$cur" ] && exit 0
+echo $new > /root/rotation
+setsid sh /root/restart-desktop.sh > /tmp/restart-desktop.out 2>&1 < /dev/null &
+EOF
+chmod +x $H/rotate.sh
+
+cat > $H/restart-desktop.sh <<'EOF'
+#!/bin/sh
+# Stop X and its helpers, then run the normal start-up again (go.sh picks native X, rotation, fallback)
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+pkill -f 'sh /tmp/go.sh'
+pkill -f '^python3 /tmp/touch.py'; pkill -f '^python3 /tmp/fbpush.py'; pkill -f '^python3 /root/idledim.py'
+pkill -f '^python3 /tmp/mirror.py'; pkill -x Xvfb; pkill -f '^/usr/libexec/Xorg'
+# wait until the old X server is really gone (its socket must be free before the new one starts)
+i=0; while [ $i -lt 40 ] && { pgrep -f '^/usr/libexec/Xorg' > /dev/null || pgrep -x Xvfb > /dev/null; }; do sleep 0.25; i=$((i+1)); done
+pkill -9 -f '^/usr/libexec/Xorg'; pkill -9 -x Xvfb; sleep 0.5
+rm -f /tmp/.X0-lock /tmp/.X11-unix/X0
+setsid sh /tmp/go.sh > /tmp/go.out 2>&1 < /dev/null &
+EOF
+chmod +x $H/restart-desktop.sh
+
 cat > $H/krita.sh <<'EOF'
 #!/bin/sh
-export HOME=/root QT_QPA_PLATFORM=xcb LIBGL_ALWAYS_SOFTWARE=1 QT_QUICK_BACKEND=software
+# already running: bring it to the front instead of starting a second copy (two copies lock the resource database)
+if pgrep -x krita >/dev/null; then
+  w=$(DISPLAY=${DISPLAY:-:0} xdotool search --onlyvisible --class krita | tail -n 1)
+  [ -n "$w" ] && DISPLAY=${DISPLAY:-:0} xdotool windowactivate "$w"
+  exit 0
+fi
+# Krita must not use OpenGL: with llvmpipe its window only paints the top part
+export HOME=/root QT_QPA_PLATFORM=xcb LIBGL_ALWAYS_SOFTWARE=1 QT_QUICK_BACKEND=software QT_XCB_GL_INTEGRATION=none
+sed -i 's/^canvasState=.*/canvasState=OPENGL_FAILED/; s/^OpenGLRenderer=.*/OpenGLRenderer=none/' /root/.config/kritarc 2>/dev/null
+# Krita's first-run copy of its default brushes/patterns into the user folder can fail ("no brush presets"); fill any gaps
+S=/usr/share/krita; U=/root/.local/share/krita
+for d in brushes paintoppresets patterns gradients palettes workspaces seexpr_scripts gamutmasks windowlayouts; do
+  [ -d $S/$d ] || continue; mkdir -p $U/$d
+  for f in "$S/$d"/*; do [ -e "$U/$d/${f##*/}" ] || cp -r "$f" "$U/$d/"; done
+done
 exec krita "$@"
 EOF
 chmod +x $H/krita.sh
 mkdir -p $H/.config
-printf '[]\ncanvasState=OPENGL_FAILED\nOpenGLRenderer=none\n' > $H/.config/kritarc
+[ -f $H/.config/kritarc ] || printf '[]\ncanvasState=OPENGL_FAILED\nOpenGLRenderer=none\n' > $H/.config/kritarc   # never overwrite the user's Krita settings
+
+cat > $H/idledim.py <<'EOF'
+#!/usr/bin/env python3
+# Dim the panel after 5 idle minutes, put it straight back on touch/pen/key.
+# Never while /tmp/pcmode exists: the panel shows the PC video and X sees no input.
+import os, time, traceback
+from Xlib import display
+from Xlib.ext import screensaver
+
+BRI = '/sys/class/backlight/pwm-backlight/brightness'
+DIM = 20
+IDLE_MS = 300000
+WOKE_MS = 2000
+LOG = '/tmp/idledim.log'
+
+
+def log(msg):
+    try:
+        with open(LOG, 'a') as f:
+            f.write(time.strftime('%H:%M:%S ') + msg + '\n')
+    except Exception:
+        pass
+
+
+def read_bri():
+    try:
+        with open(BRI) as f:
+            return int(f.read().strip())
+    except Exception:
+        return None
+
+
+def write_bri(v):
+    try:
+        with open(BRI, 'w') as f:
+            f.write(str(int(v)))
+    except Exception:
+        pass
+
+
+def main():
+    dpy = None
+    root = None
+    saved = None
+    while True:
+        try:
+            if dpy is None:
+                dpy = display.Display()
+                root = dpy.screen().root
+            ms = root.screensaver_query_info().idle
+            pc = os.path.exists('/tmp/pcmode')
+            if saved is not None:
+                if ms < WOKE_MS or pc:
+                    write_bri(saved)
+                    log('brightness back to %d' % saved)
+                    saved = None
+                    continue
+                time.sleep(0.3)
+                continue
+            if not pc and ms > IDLE_MS:
+                cur = read_bri()
+                if cur is not None and cur > DIM:
+                    saved = cur
+                    write_bri(DIM)
+                    log('idle %d s: dim to %d' % (ms // 1000, DIM))
+            time.sleep(2)
+        except Exception:
+            # never leave the screen stuck dimmed because of a hiccup
+            log(traceback.format_exc().splitlines()[-1])
+            if saved is not None:
+                write_bri(saved)
+                saved = None
+            dpy = None
+            time.sleep(3)
+
+
+main()
+EOF
+
+cat > $H/tile.py <<'EOF'
+# Arrange the open windows to fit the screen: side by side in landscape, stacked in portrait.
+# Uses the work area openbox publishes (screen minus the taskbar) and its client list.
+import subprocess, sys
+from Xlib import X, display
+d = display.Display(); root = d.screen().root
+A = lambda n: d.intern_atom(n)
+def prop(w, name):
+    p = w.get_full_property(A(name), X.AnyPropertyType)
+    return list(p.value) if p else []
+wa = prop(root, '_NET_WORKAREA')[:4] or [0, 0, root.get_geometry().width, root.get_geometry().height]
+x0, y0, ww, wh = wa
+skip = {A('_NET_WM_WINDOW_TYPE_DOCK'), A('_NET_WM_WINDOW_TYPE_DESKTOP'), A('_NET_WM_WINDOW_TYPE_SPLASH')}
+wins = []
+for wid in prop(root, '_NET_CLIENT_LIST'):
+    w = d.create_resource_object('window', wid)
+    try:
+        if skip & set(prop(w, '_NET_WM_WINDOW_TYPE')): continue
+        if A('_NET_WM_STATE_HIDDEN') in prop(w, '_NET_WM_STATE'): continue
+        wins.append(wid)
+    except Exception:
+        pass
+n = len(wins)
+if not n: sys.exit(0)
+portrait = wh > ww
+cols = 1 if portrait else min(n, 2)
+rows = (n + cols - 1) // cols
+gap, deco = 8, 30                    # gap between windows, openbox title bar height
+cw, ch = (ww - gap * (cols + 1)) // cols, (wh - gap * (rows + 1)) // rows
+for i, wid in enumerate(wins):
+    c, r = i % cols, i // cols
+    x, y = x0 + gap + c * (cw + gap), y0 + gap + r * (ch + gap)
+    subprocess.call(['xdotool', 'windowsize', str(wid), str(cw), str(ch - deco)])
+    subprocess.call(['xdotool', 'windowmove', str(wid), str(x), str(y)])
+EOF
 
 cat > $H/session.sh <<'EOF'
 #!/bin/sh
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export HOME=/root GTK_THEME=Adwaita:dark
 export DISPLAY=${DISPLAY:-:0}
+# put the panel back at the brightness the user last chose (bright.sh keeps it)
+if [ -f /root/brightness.txt ]; then
+  cat /root/brightness.txt > /sys/class/backlight/pwm-backlight/brightness 2>/dev/null
+fi
+python3 /root/idledim.py > /dev/null 2>&1 &
 xrdb -nocpp -merge /root/.Xresources
 XT="-bg #0a0c0e -fg #4fd05a -cr #f0b12a +sb -fa Mono -fs 13 -bw 0 -b 12"
 feh --bg-fill /root/wall.png &
 openbox > /tmp/ob.log 2>&1 &
 sleep 2
 tint2 -c /root/.config/tint2/tint2rc > /tmp/tint2.log 2>&1 &
-xterm $XT -T 'rosetta // shell' -geometry 78x26+50+60 -e /bin/sh -l &
-xterm $XT -T 'monitor' -geometry 78x26+1010+110 -e htop &
-pcmanfm --no-desktop > /tmp/pcmanfm.log 2>&1 &
+if [ -f /root/kiosk_krita ]; then
+  /root/krita.sh &
+else
+  xterm $XT -T 'rosetta // shell' -geometry 78x26+50+60 -e /bin/sh -l &
+  xterm $XT -T 'monitor' -geometry 78x26+1010+110 -e htop &
+  pcmanfm --no-desktop > /tmp/pcmanfm.log 2>&1 &
+  ( sleep 4; python3 /root/tile.py > /tmp/tile.log 2>&1 ) &     # fit the windows to this orientation
+fi
 EOF
 chmod +x $H/session.sh
 echo THEME-INSTALLED

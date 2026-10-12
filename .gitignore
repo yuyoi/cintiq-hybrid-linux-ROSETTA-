@@ -6,3 +6,9 @@ __pycache__/
 *.pyc
 secret.txt
 *.log
+android/build/
+android/debug.keystore
+*.apk
+pc/*.out
+pc/*.err
+shots/

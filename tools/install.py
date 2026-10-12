@@ -19,7 +19,9 @@ BB_URL = 'https://busybox.net/downloads/binaries/1.31.0-defconfig-multiarch-musl
 BB_SHA = 'cd04052b8b6885f75f50b2a280bfcbf849d8710c8e61d369c533acf307eda064'
 ALPINE_BASE = 'https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/armv7/'
 PACKAGES = ('python3 py3-xlib py3-pillow xvfb openbox tint2 feh xterm htop pcmanfm mousepad xdotool svkbd xrdb '
-            'font-dejavu adwaita-icon-theme py3-xdg')
+            'font-dejavu adwaita-icon-theme py3-xdg '
+            'xorg-server xf86-video-fbdev xf86-input-wacom xinput xrandr py3-numpy '   # native X: real pen pressure
+            'ffmpeg py3-pygame openssh-server')                                       # PC mode, DOODLE DOOM, optional ssh
 ADB = None
 
 
@@ -189,10 +191,12 @@ def install(a):
     adb('push', bb, '/data/local/tmp/busybox')
     adb('push', rootfs, '/data/local/tmp/alpine.tar.gz')
     push_text(os.path.join(HERE, 'device', 'linux-start'), '/data/local/tmp/linux-start')
+    push_text(os.path.join(HERE, 'boot', 'wifi.sh'), '/data/local/tmp/wifi.sh')
     root('mkdir -p /data/local/bin /data/local/alpine\n'
          'cp /data/local/tmp/busybox /data/local/bin/busybox && chmod 755 /data/local/bin/busybox\n'
          '/data/local/bin/busybox --install -s /data/local/bin\n'
          'cp /data/local/tmp/linux-start /data/local/bin/linux-start && chmod 755 /data/local/bin/linux-start\n'
+         'cp /data/local/tmp/wifi.sh /data/local/wifi.sh && chmod 755 /data/local/wifi.sh\n'
          '[ -e /data/local/alpine/bin/busybox ] || /data/local/bin/busybox tar -xzf /data/local/tmp/alpine.tar.gz -C /data/local/alpine\n'
          'ls /data/local/alpine/bin/busybox')
 
@@ -208,6 +212,8 @@ def install(a):
                '/data/local/bin/linux-start sh /tmp/theme_install.sh')
     if 'THEME-INSTALLED' not in out:
         die('theme install failed:\n' + out[-800:])
+    adb('push', os.path.join(REPO, 'games', 'doodledoom.py'), '/data/local/tmp/doodledoom.py')
+    root('mkdir -p /data/local/alpine/root/games && cp /data/local/tmp/doodledoom.py /data/local/alpine/root/games/doodledoom.py')
 
     say('\n[6/7] Building and flashing the Linux boot image')
     ids = root('B=/data/local/bin/busybox; echo VID=$($B cat /sys/class/android_usb/android0/idVendor) '
