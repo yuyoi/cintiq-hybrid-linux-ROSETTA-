@@ -58,7 +58,10 @@ user32.InjectSyntheticPointerInput.restype = wt.BOOL
 user32.InjectSyntheticPointerInput.argtypes = [wt.HANDLE, ctypes.POINTER(POINTER_TYPE_INFO), ctypes.c_uint32]
 
 VK = {'ctrl': 0x11, 'shift': 0x10, 'alt': 0x12, 'esc': 0x1B, 'escape': 0x1B, 'enter': 0x0D, 'space': 0x20,
-      'less': 0xBC, 'greater': 0xBE, 'bracketleft': 0xDB, 'bracketright': 0xDD}
+      'less': 0xBC, 'greater': 0xBE, 'bracketleft': 0xDB, 'bracketright': 0xDD,
+      'backspace': 0x08, 'tab': 0x09, 'delete': 0x2E, 'home': 0x24, 'end': 0x23, 'pageup': 0x21, 'pagedown': 0x22,
+      'left': 0x25, 'up': 0x26, 'right': 0x27, 'down': 0x28}
+EXTENDED = {0x2E, 0x24, 0x23, 0x21, 0x22, 0x25, 0x26, 0x27, 0x28}       # arrows & co. are "extended" keys, not keypad ones
 
 
 def vk_for(name):
@@ -68,12 +71,57 @@ def vk_for(name):
     return None, False
 
 
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = [('wVk', wt.WORD), ('wScan', wt.WORD), ('dwFlags', wt.DWORD), ('time', wt.DWORD), ('dwExtraInfo', ctypes.c_size_t)]
+
+
+class MOUSEINPUT(ctypes.Structure):
+    _fields_ = [('dx', wt.LONG), ('dy', wt.LONG), ('mouseData', wt.DWORD), ('dwFlags', wt.DWORD), ('time', wt.DWORD),
+                ('dwExtraInfo', ctypes.c_size_t)]
+
+
+class INPUT(ctypes.Structure):
+    class _U(ctypes.Union):
+        _fields_ = [('ki', KEYBDINPUT), ('mi', MOUSEINPUT)]
+    _anonymous_ = ('u',)
+    _fields_ = [('type', wt.DWORD), ('u', _U)]
+
+
+def type_char(cp):
+    """One character from the tablet keyboard. Letters and digits go as real keys (so app shortcuts work too),
+    everything else (æ ø å, € ...) as Unicode, which doesn't depend on the PC's keyboard layout."""
+    ch = chr(cp)
+    if ch.isascii() and (ch.isalnum() or ch == ' '):
+        return send_keys(('shift+' + ch.lower()) if ch.isupper() else ('space' if ch == ' ' else ch))
+    units = [cp] if cp < 0x10000 else [0xD800 + ((cp - 0x10000) >> 10), 0xDC00 + ((cp - 0x10000) & 0x3FF)]
+    ins = (INPUT * (2 * len(units)))()
+    for i, u in enumerate(units):
+        for j, up in enumerate((0, 2)):                                 # KEYEVENTF_UNICODE, then with KEYEVENTF_KEYUP
+            k = ins[2 * i + j]; k.type = 1; k.ki.wScan = u; k.ki.dwFlags = 4 | up
+    user32.SendInput(len(ins), ins, ctypes.sizeof(INPUT))
+    return True
+
+
+def toggle_osk():
+    """Windows' on-screen keyboard: CreateProcess is refused for osk.exe (error 740), so open it through the shell and
+    close it with a window message (taskkill is denied too)."""
+    user32.FindWindowW.restype = ctypes.c_void_p
+    user32.FindWindowW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p]
+    user32.PostMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t]
+    h = user32.FindWindowW('OSKMainClass', None)
+    if h:
+        user32.PostMessageW(h, 0x0112, 0xF060, 0)                   # WM_SYSCOMMAND, SC_CLOSE
+    else:
+        os.startfile('osk.exe')
+
+
 def send_keys(action):
     """action like 'ctrl+shift+z' -> press/release with modifiers."""
-    if action.lower() == 'osk':        # toggle the Windows on-screen keyboard
-        if subprocess.run(['taskkill', '/im', 'osk.exe'], capture_output=True).returncode != 0:
-            subprocess.Popen(['osk.exe'])
+    if action.lower() == 'osk':
+        toggle_osk()
         return True
+    if action.startswith('u:'):                                         # a typed character, as a hex code point
+        return type_char(int(action[2:], 16))
     parts = action.lower().split('+')
     seq = []
     for p in parts:
@@ -84,10 +132,46 @@ def send_keys(action):
     for vk, shifted in seq:
         if shifted and 0x10 not in [d for d, _ in down]:
             user32.keybd_event(0x10, 0, 0, 0); down.append((0x10, False))
-        user32.keybd_event(vk, 0, 0, 0); down.append((vk, shifted))
+        user32.keybd_event(vk, 0, 1 if vk in EXTENDED else 0, 0); down.append((vk, shifted))
     for vk, _ in reversed(down):
-        user32.keybd_event(vk, 0, 2, 0)
+        user32.keybd_event(vk, 0, (1 if vk in EXTENDED else 0) | 2, 0)
     return True
+
+
+class FocusWatch:
+    """Where the PC's focused text box is (UI Automation, through focuswatch.exe), so the tablet keyboard can pop up
+    by itself. Without it (build failed) the keyboard still works from the tablet's Menu key."""
+    def __init__(self):
+        self.edit = None                 # (left, top, right, bottom) of the focused text box, or None
+        self.changed = 0                 # bumps on every change
+        exe = self.build()
+        if exe:
+            self.p = subprocess.Popen([exe, str(os.getpid())], stdout=subprocess.PIPE, text=True, creationflags=0x08000000)
+            import threading
+            threading.Thread(target=self.read, daemon=True).start()
+
+    @staticmethod
+    def build():
+        here = os.path.dirname(os.path.abspath(__file__))
+        src, exe = os.path.join(here, 'focuswatch.cs'), os.path.join(here, 'focuswatch.exe')
+        if os.path.exists(exe) and os.path.getmtime(exe) >= os.path.getmtime(src):
+            return exe
+        fw = os.path.join(os.environ.get('WINDIR', r'C:\Windows'), 'Microsoft.NET', 'Framework64', 'v4.0.30319')
+        refs = ['/r:' + os.path.join(fw, 'WPF', d) for d in ('UIAutomationClient.dll', 'UIAutomationTypes.dll', 'WindowsBase.dll')]
+        try:
+            r = subprocess.run([os.path.join(fw, 'csc.exe'), '/nologo', '/optimize', '/out:' + exe] + refs + [src],
+                               capture_output=True, text=True)
+        except OSError as e:
+            print('auto keyboard off (no C# compiler: %s)' % e, flush=True); return None
+        if r.returncode:
+            print('auto keyboard off (focuswatch build failed):', r.stdout[-300:], flush=True); return None
+        return exe
+
+    def read(self):
+        for ln in self.p.stdout:
+            f = ln.split()
+            self.edit = tuple(int(v) for v in f[1:5]) if len(f) == 5 and f[0] == '1' else None
+            self.changed += 1
 
 
 class Pen:
@@ -134,6 +218,7 @@ class Pen:
             return
         if contact and not self.contact:
             self.inject(F_DOWN | F_INRANGE | F_INCONTACT | F_FIRST, pf, x, y, max(pressure, 1), tx, ty); self.contact = True
+            TAP[:] = [time.monotonic(), x, y]
         elif contact:
             self.inject(F_UPDATE | F_INRANGE | F_INCONTACT | F_FIRST, pf, x, y, max(pressure, 1), tx, ty)
         elif self.contact:
@@ -168,7 +253,7 @@ class Touch:
         self.x = self.rx + int(nx / 65535.0 * (self.rw - 1)); self.y = self.ry + int(ny / 65535.0 * (self.rh - 1))
         if down and not self.contact:
             self.inject(F_DOWN | F_INRANGE | F_INCONTACT | F_PRIMARY); self.contact = True
-            print('touch down at', self.x, self.y, 'from', nx, ny, flush=True)
+            TAP[:] = [time.monotonic(), self.x, self.y]
         elif down:
             self.inject(F_UPDATE | F_INRANGE | F_INCONTACT | F_PRIMARY)
         elif self.contact:
@@ -181,6 +266,35 @@ class Touch:
 
 
 PEN_UNTIL = [0.0]        # monotonic time until which the pen "owns" the cursor
+TAP = [0.0, 0, 0]        # last pen or finger touch-down from the tablet: time, x, y (screen pixels)
+
+
+class AutoKeyboard:
+    """Pops the tablet's keyboard up when a tap from the tablet puts the PC's focus in a text box (or lands in the one
+    that has it), and back down when the focus leaves text. The PC's own mouse and keyboard never trigger it."""
+    def __init__(self, ctl, port):
+        self.fw, self.ctl, self.to = FocusWatch(), ctl, ('127.0.0.1', port)
+        self.seen, self.tap, self.shown = 0, 0.0, False
+
+    def send(self, show, bottom=0):
+        self.ctl.sendto(('kbd %d %d' % (show, bottom)).encode(), self.to)
+        self.shown = bool(show)
+
+    def check(self, region):
+        rx, ry, rw, rh = region
+        e, now = self.fw.edit, time.monotonic()
+        inside = e and rx <= (e[0] + e[2]) // 2 < rx + rw and ry <= (e[1] + e[3]) // 2 < ry + rh
+        bottom = max(0, min(65535, int((e[3] - ry) * 65535 / rh))) if inside else 0
+        if self.fw.changed != self.seen:                      # the focus moved
+            self.seen = self.fw.changed
+            if inside and now - TAP[0] < 2.0:
+                self.send(1, bottom)
+            elif self.shown and not inside:
+                self.send(0)
+        if TAP[0] != self.tap and now - TAP[0] > 0.25:       # a tap that didn't move the focus: was it in the text box?
+            self.tap = TAP[0]
+            if inside and e[0] - 8 <= TAP[1] <= e[2] + 8 and e[1] - 8 <= TAP[2] <= e[3] + 8:
+                self.send(1, bottom)
 
 
 def start_mouse_priority(hold):
@@ -223,6 +337,11 @@ def region_for(mode):
     return monitors.pick(mode)[1:5]
 
 
+def other_monitor(mode):
+    """The screen the tablet's Search key flips to: the main screen (mirror) <-> the extended one."""
+    return 'second' if mode in ('primary', '1') else 'primary'
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--bind', default='0.0.0.0')
@@ -244,11 +363,18 @@ def main():
     print('region', (pen.rx, pen.ry, pen.rw, pen.rh), 'listening', a.bind, a.port, 'allow', a.allow, flush=True)
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.bind((a.bind, a.port))
+    ctl = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)          # tells wireless_cintiq.py to switch screens / keyboard
+    kb = AutoKeyboard(ctl, a.port + 2)
+    mode = a.monitor
     last = -1
     stats = [0, 0]
     t0 = time.time()
     s.settimeout(0.05)
     while True:
+        try:
+            kb.check((pen.rx, pen.ry, pen.rw, pen.rh))
+        except OSError:
+            pass
         try:
             data, addr = s.recvfrom(512)
         except socket.timeout:
@@ -276,8 +402,18 @@ def main():
             stats[0] += 1
         elif kind == b'K':
             act = payload[5:29].split(b'\0')[0].decode('utf-8', 'ignore')
-            print('key', act, flush=True)
-            send_keys(act)
+            if not act.startswith('u:'):                       # typed text is never logged (passwords)
+                print('key', act, flush=True)
+            if act == 'screen':                                 # pen + touch follow; the streamer switches the picture
+                mode = other_monitor(mode)
+                pen.rx, pen.ry, pen.rw, pen.rh = touch.rx, touch.ry, touch.rw, touch.rh = region_for(mode)
+                ctl.sendto(('screen ' + mode).encode(), ('127.0.0.1', a.port + 2))
+                print('screen ->', mode, (pen.rx, pen.ry, pen.rw, pen.rh), flush=True)
+            else:
+                try:
+                    send_keys(act)
+                except Exception as e:                         # a key action must never take the pen down with it
+                    print('key action failed: %r' % (e,), flush=True)
         if time.time() - t0 > 30:
             print('packets ok=%d bad=%d' % tuple(stats), flush=True); t0 = time.time()
 

@@ -77,6 +77,20 @@ class AndroidSender:
                 print('Rosetta Screen app at %s:%d' % addr, flush=True)
                 self.target = addr
 
+    def send_ctl(self, show, bottom):
+        """Tell the app to show (1) or hide (0) its keyboard; bottom = lower edge of the text box, 0..65535 down the
+        picture, so the app can slide the picture up if the keyboard would cover it. Signed like the hello answers."""
+        if not self.target:
+            return
+        self.seq = max(self.seq + 1, int(time.time() * 1000) & 0xFFFFFFFF)
+        p = b'C' + struct.pack('<IcBH', self.seq, b'k', show, bottom)
+        p += hmac.new(self.secret, p, hashlib.sha256).digest()[:8]
+        for _ in range(2):                                             # sent twice: one lost datagram mustn't matter
+            try:
+                self.hello.sendto(p, self.target)
+            except OSError:
+                pass
+
     def send_frame(self, frame):
         if not self.target:
             return
@@ -163,24 +177,30 @@ def main():
     ff = find_ffmpeg()
     print('PC %s | monitor %s %s %dx%d at %d,%d | tablet %s' % (bind, a.monitor, dev, w, h, mx, my, a.tablet_ip), flush=True)
 
-    inj = subprocess.Popen([sys.executable, '-u', os.path.join(HERE, 'pen_injector.py'),
-                            '--bind', bind, '--port', str(a.port), '--allow', 'any' if android else a.tablet_ip, '--monitor', a.monitor] + (['--no-mouse-priority'] if a.no_mouse_priority else []))
+    def injector(mon):
+        return subprocess.Popen([sys.executable, '-u', os.path.join(HERE, 'pen_injector.py'), '--bind', bind, '--port', str(a.port),
+                                 '--allow', 'any' if android else a.tablet_ip, '--monitor', mon] + (['--no-mouse-priority'] if a.no_mouse_priority else []))
+    inj = injector(a.monitor)
     gop = str(a.fps)
-    # ddagrab = GPU desktop duplication: gdigrab tops out near 16 fps on a 4K screen, which is what made it lag
-    vf = 'ddagrab=0:framerate=%d:draw_mouse=1,hwdownload,format=bgra,scale=%s:flags=bicubic,format=yuv420p' % (a.fps, a.res.replace('x', ':'))
-    out_idx = None if a.monitor in ('primary', '1') else dda_output(ff, w, h)
-    if a.monitor in ('primary', '1'):
-        src = ['-init_hw_device', 'd3d11va', '-filter_complex', vf]
-    elif out_idx is not None:                       # GPU capture of the extended screen: fastest, lowest latency
-        sc = '' if (w, h) == tuple(int(v) for v in a.res.split('x')) else 'scale=%s:flags=bicubic,' % a.res.replace('x', ':')
-        src = ['-init_hw_device', 'd3d11va', '-filter_complex',
-               'ddagrab=output_idx=%d:framerate=%d:draw_mouse=1,hwdownload,format=bgra,%sformat=yuv420p' % (out_idx, a.fps, sc)]
-    else:
-        # extended screen: grab exactly that monitor's area; a 1920x1080 monitor goes over 1:1 with no scaling
-        sc = '' if (w, h) == tuple(int(v) for v in a.res.split('x')) else 'scale=%s:flags=bicubic,' % a.res.replace('x', ':')
-        src = ['-f', 'gdigrab', '-framerate', str(a.fps), '-draw_mouse', '1', '-offset_x', str(mx), '-offset_y', str(my),
-               '-video_size', '%dx%d' % (w, h), '-i', 'desktop', '-vf', sc + 'format=yuv420p']
-    enc = ['-c:v', 'libx264', '-threads', '4', '-preset', 'veryfast', '-tune', 'zerolatency', '-profile:v', 'baseline', '-bf', '0', '-g', gop,
+    dda = {}
+
+    def source(mon):
+        """ffmpeg input + filters for one screen. ddagrab = GPU desktop duplication (gdigrab tops out near 16 fps on 4K)."""
+        _, mx, my, w, h = monitors.pick(mon)
+        # area = clean text on the 4K main screen's exact 2:1 shrink; a 1920x1080 screen goes over 1:1 with no scaling
+        sc = '' if (w, h) == tuple(int(v) for v in a.res.split('x')) else 'scale=%s:flags=area,' % a.res.replace('x', ':')
+        if mon in ('primary', '1'):
+            idx = 0
+        else:
+            if mon not in dda:
+                dda[mon] = dda_output(ff, w, h)
+            idx = dda[mon]
+        if idx is not None:
+            return ['-init_hw_device', 'd3d11va', '-filter_complex',
+                    'ddagrab=output_idx=%d:framerate=%d:draw_mouse=1,hwdownload,format=bgra,%sformat=yuv420p' % (idx, a.fps, sc)]
+        return ['-f', 'gdigrab', '-framerate', str(a.fps), '-draw_mouse', '1', '-offset_x', str(mx), '-offset_y', str(my),
+                '-video_size', '%dx%d' % (w, h), '-i', 'desktop', '-vf', sc + 'format=yuv420p']
+    enc =['-c:v', 'libx264', '-threads', '4', '-preset', 'veryfast', '-tune', 'zerolatency', '-profile:v', 'baseline', '-bf', '0', '-g', gop,
            # Linux player: intra-refresh (no keyframe bursts). Android app: the Tegra hardware decoder needs real IDR keyframes
            '-x264-params', ('repeat-headers=1:scenecut=0:sliced-threads=1:aud=1:keyint=%d' % a.fps) if android else
                            'repeat-headers=1:scenecut=0:intra-refresh=1:keyint=15:sliced-threads=1',
@@ -188,21 +208,48 @@ def main():
     if android:
         secret = open(os.path.join(HERE, 'secret.txt'), 'rb').read().strip()
         sender = AndroidSender(bind, a.port + 1, a.video_port, secret, a.tablet_ip)
-        vid = subprocess.Popen([ff, '-hide_banner', '-loglevel', 'warning'] + src + enc + ['-flush_packets', '1', '-f', 'h264', '-'],
-                               stdout=subprocess.PIPE, bufsize=0)
-        threading.Thread(target=sender.pump, args=(vid.stdout,), daemon=True).start()
+
+    def start(mon):
+        if android:
+            v = subprocess.Popen([ff, '-hide_banner', '-loglevel', 'warning'] + source(mon) + enc + ['-flush_packets', '1', '-f', 'h264', '-'],
+                                 stdout=subprocess.PIPE, bufsize=0)
+            threading.Thread(target=sender.pump, args=(v.stdout,), daemon=True).start()
+            return v
+        return subprocess.Popen([ff, '-hide_banner', '-loglevel', 'warning'] + source(mon) + enc + [
+            '-flush_packets', '1', '-muxdelay', '0', '-muxpreload', '0', '-f', 'mpegts', 'udp://%s:%d?pkt_size=1316' % (a.tablet_ip, a.video_port)])
+    vid = start(a.monitor)
+    if android:
         print('streaming %s @%d fps for the Rosetta Screen app (waiting for its hello on %s:%d)  |  pen injector on %s:%d' %
               (a.res, a.fps, bind, a.port + 1, bind, a.port), flush=True)
     else:
-        vid = subprocess.Popen([ff, '-hide_banner', '-loglevel', 'warning'] + src + enc + [
-            '-flush_packets', '1', '-muxdelay', '0', '-muxpreload', '0', '-f', 'mpegts', 'udp://%s:%d?pkt_size=1316' % (a.tablet_ip, a.video_port)])
         print('streaming %s @%d fps to udp://%s:%d  |  pen injector listening on %s:%d' %
               (a.res, a.fps, a.tablet_ip, a.video_port, bind, a.port), flush=True)
-    print('Press Ctrl+C to stop.', flush=True)
+    # the tablet's Search key reaches the pen injector, which switches the pen and tells us here to switch the picture
+    ctl = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    ctl.bind(('127.0.0.1', a.port + 2))
+    ctl.settimeout(1.0)
+    print('Tablet: Search = mirror the main screen <-> extended screen, Menu = keyboard (also pops up on text boxes).  '
+          'Ctrl+C stops.', flush=True)
+    cur = a.monitor
     try:
-        while inj.poll() is None and vid.poll() is None:
-            time.sleep(1)
-        print('a component exited (injector=%s, stream=%s)' % (inj.poll(), vid.poll()))
+        while True:
+            if inj.poll() is not None:                 # never let one part take the whole screen down: bring it back
+                print('pen injector exited (%s), restarting' % inj.poll(), flush=True)
+                time.sleep(1); inj = injector(cur)
+            if vid.poll() is not None:
+                print('stream exited (%s), restarting' % vid.poll(), flush=True)
+                time.sleep(1); vid = start(cur)
+            try:
+                msg = ctl.recv(64).decode('ascii', 'ignore').split()
+            except socket.timeout:
+                continue
+            if len(msg) == 3 and msg[0] == 'kbd' and android:          # the injector saw a text box get / lose focus
+                sender.send_ctl(int(msg[1]), int(msg[2]))
+            if len(msg) == 2 and msg[0] == 'screen':
+                cur = msg[1]
+                vid.terminate(); vid.wait()
+                vid = start(cur)
+                print('picture ->', cur, flush=True)
     except KeyboardInterrupt:
         pass
     finally:

@@ -12,3 +12,5 @@ android/debug.keystore
 pc/*.out
 pc/*.err
 shots/
+*.idsig
+pc/focuswatch.exe

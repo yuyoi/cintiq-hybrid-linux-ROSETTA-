@@ -75,6 +75,11 @@ public class ScreenActivity extends Activity implements SurfaceHolder.Callback {
     boolean touchDown;
     float lastTx, lastTy;
 
+    Keys keys;                                     // the tablet's own keyboard for the PC
+    boolean kbTouch;                               // the current touch started on the keyboard
+    int pan;                                       // picture slid up by this much so the text box stays above the keyboard
+    long ctlSeq;
+
     @Override
     protected void onCreate(Bundle b) {
         super.onCreate(b);
@@ -90,6 +95,12 @@ public class ScreenActivity extends Activity implements SurfaceHolder.Callback {
         status.setBackgroundColor(0xAA000000);
         status.setPadding(16, 8, 16, 8);
         root.addView(status, new FrameLayout.LayoutParams(-2, -2));
+        keys = new Keys(this, new Keys.Out() {
+            public void key(String a) { sendKey(a); }
+            public void hide() { hideKeys(); }
+        });
+        keys.setVisibility(View.GONE);
+        root.addView(keys, new FrameLayout.LayoutParams(-1, 0, Gravity.BOTTOM));
         View black = new View(this);
         black.setBackgroundColor(Color.BLACK);
         setContentView(black);                                       // the activity itself stays an empty black page
@@ -107,8 +118,9 @@ public class ScreenActivity extends Activity implements SurfaceHolder.Callback {
         Overlay(Context c) { super(c); setFocusableInTouchMode(true); }
         @Override public boolean dispatchTouchEvent(MotionEvent e) { handle(e, true); return true; }
         @Override public boolean dispatchGenericMotionEvent(MotionEvent e) { handle(e, false); return true; }
-        @Override public boolean dispatchKeyEvent(KeyEvent e) {
-            return e.getAction() == KeyEvent.ACTION_DOWN ? onKeyDown(e.getKeyCode(), e) : onKeyUp(e.getKeyCode(), e);
+        @Override public boolean dispatchKeyEvent(KeyEvent e) {             // the activity's handlers, not View's own
+            return e.getAction() == KeyEvent.ACTION_DOWN ? ScreenActivity.this.onKeyDown(e.getKeyCode(), e)
+                                                         : ScreenActivity.this.onKeyUp(e.getKeyCode(), e);
         }
     }
 
@@ -131,6 +143,34 @@ public class ScreenActivity extends Activity implements SurfaceHolder.Callback {
         if (!shown) return;
         try { getWindowManager().removeView(root); } catch (Exception ignored) { }
         shown = false;
+    }
+
+    // ------------------------------------------------------------------ keyboard
+    // Shown by the Menu key, or by the PC when a tap from here puts its focus in a text box. bottom = that box's lower
+    // edge (0..65535 down the picture, 0 = unknown): if the keyboard would cover it, the picture slides up.
+    void showKeys(int bottom) {
+        int h = root.getHeight();
+        if (h < 2) return;
+        int kh = h * 2 / 5;
+        FrameLayout.LayoutParams kl = (FrameLayout.LayoutParams) keys.getLayoutParams();
+        if (kl.height != kh) { kl.height = kh; keys.setLayoutParams(kl); }
+        keys.setVisibility(View.VISIBLE);
+        int fb = (int) ((long) bottom * h / 65535), room = h - kh - 16;
+        setPan(bottom > 0 && fb > room ? Math.min(kh, fb - room) : 0);
+    }
+
+    void hideKeys() {
+        keys.setVisibility(View.GONE);
+        setPan(0);
+    }
+
+    void setPan(int p) {
+        if (p == pan) return;
+        pan = p;
+        FrameLayout.LayoutParams vl = (FrameLayout.LayoutParams) view.getLayoutParams();
+        vl.height = root.getHeight();
+        vl.topMargin = -p;
+        view.setLayoutParams(vl);
     }
 
     void loadConfig() {
@@ -227,14 +267,14 @@ public class ScreenActivity extends Activity implements SurfaceHolder.Callback {
         int flags = (inRange ? 1 : 0) | (contact ? 2 : 0) | (barrel ? 4 : 0) | (eraser ? 8 : 0);
         int press = contact ? Math.max(1, Math.min(1023, (int) (pressure * 1023))) : 0;
         ByteBuffer bb = pkt('P', 16);
-        bb.put((byte) flags).putShort((short) norm(x, view.getWidth())).putShort((short) norm(y, view.getHeight()))
+        bb.put((byte) flags).putShort((short) norm(x, view.getWidth())).putShort((short) norm(y + pan, view.getHeight()))
           .putShort((short) press).put((byte) 0).put((byte) 0);
         send(bb, port);
     }
 
     void sendTouch(boolean down, float x, float y) {
         ByteBuffer bb = pkt('T', 12);
-        bb.put((byte) (down ? 1 : 0)).putShort((short) norm(x, view.getWidth())).putShort((short) norm(y, view.getHeight()));
+        bb.put((byte) (down ? 1 : 0)).putShort((short) norm(x, view.getWidth())).putShort((short) norm(y + pan, view.getHeight()));
         send(bb, port);
         lastTx = x; lastTy = y;
     }
@@ -251,6 +291,18 @@ public class ScreenActivity extends Activity implements SurfaceHolder.Callback {
     void handle(MotionEvent e, boolean touchStream) {
         if (view.getWidth() < 2) return;
         int tool = e.getToolType(0), act = e.getActionMasked();
+        boolean kbOn = keys.getVisibility() == View.VISIBLE;
+        float kbTop = root.getHeight() - keys.getHeight();
+        if (touchStream && act == MotionEvent.ACTION_DOWN) kbTouch = kbOn && e.getY(0) >= kbTop;
+        if (kbTouch) {                                                // the whole touch belongs to the keyboard
+            if (touchStream) {
+                keys.touch(e, kbTop);
+                if (act == MotionEvent.ACTION_UP || act == MotionEvent.ACTION_CANCEL) kbTouch = false;
+            }
+            return;
+        }
+        if (!touchStream && kbOn && e.getY(0) >= kbTop) return;       // pen hovering over the keyboard (a stroke that
+                                                                      // started on the picture still ends on the PC)
         if (tool == MotionEvent.TOOL_TYPE_STYLUS || tool == MotionEvent.TOOL_TYPE_ERASER) {
             lastPen = SystemClock.uptimeMillis();
             if (touchDown) { sendTouch(false, lastTx, lastTy); touchDown = false; }
@@ -277,8 +329,10 @@ public class ScreenActivity extends Activity implements SurfaceHolder.Callback {
             case KeyEvent.KEYCODE_BACK: finish(); return true;
             case KeyEvent.KEYCODE_VOLUME_UP: a = "ctrl+z"; break;
             case KeyEvent.KEYCODE_VOLUME_DOWN: a = "ctrl+shift+z"; break;
-            case KeyEvent.KEYCODE_MENU: a = "osk"; break;
-            case KeyEvent.KEYCODE_SEARCH: a = "e"; break;
+            case KeyEvent.KEYCODE_MENU:                                        // the tablet keyboard on / off
+                if (e.getRepeatCount() == 0) { if (keys.getVisibility() == View.VISIBLE) hideKeys(); else showKeys(0); }
+                return true;
+            case KeyEvent.KEYCODE_SEARCH: a = "screen"; break;                // PC flips mirror <-> extended screen
         }
         if (a == null) return super.onKeyDown(code, e);
         if (e.getRepeatCount() == 0) sendKey(a);
@@ -338,6 +392,13 @@ public class ScreenActivity extends Activity implements SurfaceHolder.Callback {
         }
     }
 
+    boolean signed(byte[] b, int n) {                              // the PC's HMAC tag (last 8 bytes) is right
+        byte[] tag;
+        synchronized (this) { verify.update(b, 0, n - 8); tag = verify.doFinal(); }
+        for (int k = 0; k < 8; k++) if (tag[k] != b[n - 8 + k]) return false;
+        return true;
+    }
+
     static int nal(byte[] f, int from) {                          // index of the next 00 00 01 start code, or -1
         for (int i = from; i + 2 < f.length; i++)
             if (f[i] == 0 && f[i + 1] == 0 && f[i + 2] == 1) return i;
@@ -369,7 +430,16 @@ public class ScreenActivity extends Activity implements SurfaceHolder.Callback {
         int cur = -1, need = 0, got = 0;
         byte[][] frags = null;
         boolean done = true;
+        // Latency probe (only if /sdcard/rosetta/probe exists): a second hardware decoder outputs into memory, and the
+        // moment the PC's flip square (top-left) changes brightness we tell the PC (UDP 5610), which times the trip.
+        boolean probe = new File(Environment.getExternalStorageDirectory(), "rosetta/probe").exists();
+        MediaCodec pdec = null;
+        ByteBuffer[] pin = null, pout = null;
+        MediaCodec.BufferInfo pbi = new MediaCodec.BufferInfo();
+        int stride = 1920, cfmt = 0, lastBright = -1;
+        DatagramSocket psock = null;
         try {
+            if (probe) psock = new DatagramSocket();
             in = new DatagramSocket(null);
             in.setReuseAddress(true);
             in.bind(new InetSocketAddress(videoPort));
@@ -383,12 +453,19 @@ public class ScreenActivity extends Activity implements SurfaceHolder.Callback {
                 boolean have = false;
                 try { in.receive(dp); have = true; } catch (SocketTimeoutException t) { }
                 if (have && dp.getLength() >= 13 && buf[0] == 'A') {               // the PC answering our hello
-                    int n = dp.getLength();
-                    byte[] tag;
-                    synchronized (this) { verify.update(buf, 0, n - 8); tag = verify.doFinal(); }
-                    boolean ok = true;
-                    for (int k = 0; k < 8; k++) if (tag[k] != buf[n - 8 + k]) ok = false;
-                    if (ok && !dp.getAddress().equals(pc)) { pc = dp.getAddress(); host = pc.getHostAddress(); info = "PC " + host + "  hardware decoder"; }
+                    if (signed(buf, dp.getLength()) && !dp.getAddress().equals(pc)) { pc = dp.getAddress(); host = pc.getHostAddress(); info = "PC " + host + "  hardware decoder"; }
+                    continue;
+                }
+                if (have && dp.getLength() == 17 && buf[0] == 'C' && signed(buf, 17)) {   // the PC: keyboard up / down
+                    ByteBuffer c = ByteBuffer.wrap(buf, 1, 8).order(ByteOrder.LITTLE_ENDIAN);
+                    long s = c.getInt() & 0xffffffffL;
+                    byte cmd = c.get();
+                    final boolean show = c.get() != 0;
+                    final int bottom = c.getShort() & 0xffff;
+                    if (cmd == 'k' && (s > ctlSeq || ctlSeq - s > 1000000)) {     // newer than the last one (no replays)
+                        ctlSeq = s;
+                        runOnUiThread(new Runnable() { public void run() { if (show) showKeys(bottom); else hideKeys(); } });
+                    }
                     continue;
                 }
                 if (have && dp.getLength() > 15 && buf[0] == 'W') {
@@ -425,6 +502,14 @@ public class ScreenActivity extends Activity implements SurfaceHolder.Callback {
                                     dec.start();
                                     inputs = dec.getInputBuffers();
                                     info = "PC " + host + "  hardware decoder";
+                                    if (probe) {
+                                        pdec = MediaCodec.createDecoderByType("video/avc");
+                                        pdec.configure(fmt, null, null, 0);
+                                        pdec.start();
+                                        pin = pdec.getInputBuffers();
+                                        pout = pdec.getOutputBuffers();
+                                        info = "PC " + host + "  LATENCY PROBE";
+                                    }
                                 }
                             }
                             if (dec != null) {
@@ -437,8 +522,41 @@ public class ScreenActivity extends Activity implements SurfaceHolder.Callback {
                                 } else {
                                     dropped++;                                         // decoder busy: drop, never queue
                                 }
+                                if (pdec != null) {
+                                    int px = pdec.dequeueInputBuffer(2000);
+                                    if (px >= 0) {
+                                        ByteBuffer pb = pin[px];
+                                        pb.clear();
+                                        pb.put(frame);
+                                        pdec.queueInputBuffer(px, 0, frame.length, SystemClock.uptimeMillis() * 1000, 0);
+                                    }
+                                }
                             }
                         }
+                    }
+                }
+                if (pdec != null) {
+                    while (true) {
+                        int ox = pdec.dequeueOutputBuffer(pbi, 0);
+                        if (ox == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                            MediaFormat of = pdec.getOutputFormat();
+                            if (of.containsKey("stride")) stride = of.getInteger("stride");
+                            if (of.containsKey("color-format")) cfmt = of.getInteger("color-format");
+                            info = "PC " + host + "  LATENCY PROBE  stride " + stride + " fmt 0x" + Integer.toHexString(cfmt);
+                            continue;
+                        }
+                        if (ox == MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED) { pout = pdec.getOutputBuffers(); continue; }
+                        if (ox < 0) break;
+                        int off = pbi.offset + 60 * stride + 60;                       // luma at (60, 60)
+                        if (off < pbi.offset + pbi.size) {
+                            int bright = (pout[ox].get(off) & 0xff) > 128 ? 1 : 0;
+                            if (lastBright >= 0 && bright != lastBright && pc != null) {
+                                byte[] note = "flip".getBytes();
+                                try { psock.send(new DatagramPacket(note, note.length, pc, 5610)); } catch (Exception ignored) { }
+                            }
+                            lastBright = bright;
+                        }
+                        pdec.releaseOutputBuffer(ox, false);
                     }
                 }
                 if (dec != null) {                                                     // show every decoded frame at once
@@ -454,6 +572,8 @@ public class ScreenActivity extends Activity implements SurfaceHolder.Callback {
             info = "video error: " + e;
         } finally {
             if (dec != null) { try { dec.stop(); } catch (Exception ignored) { } dec.release(); }
+            if (pdec != null) { try { pdec.stop(); } catch (Exception ignored) { } pdec.release(); }
+            if (psock != null) psock.close();
             if (in != null) in.close();
         }
     }

@@ -54,8 +54,23 @@ can never get stuck.
    screen to **1920 x 1080** and *Extend these displays*.
 4. Run **`pc/start_rosetta_screen.bat`**, then pick **WIRELESS SCREEN** on the tablet.
 
-The pen draws on that screen only, with pressure. Fingers tap, drag and scroll (ignored while the pen is near, so you
-can rest your hand). Volume buttons are undo / redo, Menu toggles Windows' on-screen keyboard, Back exits.
+The pen draws on that screen, with pressure. Fingers tap, drag and scroll (ignored while the pen is near, so you can
+rest your hand).
+
+| Tablet button | In the wireless screen |
+|---|---|
+| Search | switch between **extending** (the second screen) and **mirroring** your main screen; pen and touch follow |
+| Menu | the tablet's keyboard on / off |
+| Volume + / − | undo / redo |
+| Back | exit |
+
+**Keyboard:** tap a text box on the PC with a finger or the pen and the tablet's own keyboard pops up (æ ø å,
+symbols, arrows, Ctrl and Shift, Shift twice for caps lock). If the keyboard would cover the box, the picture slides
+up. The PC finds text boxes through Windows UI Automation (`pc/focuswatch.cs`, compiled on first run with the C#
+compiler that comes with Windows). A few apps don't report their text areas (Word's page, for one): use Menu there.
+Typed text is never logged.
+
+**Mirror** shrinks a 4K main screen to the tablet's 1920 x 1080 on the CPU, so it costs a bit more CPU than extending.
 
 **Away from home:** forward **UDP 5600-5601** on your router to the PC, pair with `--remote`, and run
 `pc/start_rosetta_remote.bat` (30 fps, 6 Mbit/s for home upload speeds). Public Wi-Fi that isolates devices can't
@@ -130,16 +145,17 @@ set the way recovery sets it. So:
    areas X reports as changed (XDamage) onto the second framebuffer page with alpha set, and shows that page.
 4. A bridge reads the finger, the buttons and (in PC mode) the pen straight from evdev.
 
-**Rosetta Screen** is a 20 KB Android app. The PC captures the second screen on the GPU (`ddagrab`), encodes H.264
+**Rosetta Screen** is a 25 KB Android app. The PC captures the second screen on the GPU (`ddagrab`), encodes H.264
 (`x264` zerolatency), encrypts it (AES-256-CTR, Windows' own crypto) and sends whole frames as numbered UDP
 fragments. The app puts complete frames into the Tegra's hardware decoder and drops late ones instead of queueing
 them. It draws in an overlay window above the Android system bar, so the video goes straight to the panel. Pen,
 touch and keys go back as HMAC-signed packets; the PC injects them as a real Windows pen (pressure, eraser, barrel
 button) and touch.
 
-Measured with the probes in `pc/` (a square flips on the PC, the tablet reports when it sees it): the Linux-mode
-software decoder lands at about **335 ms** glass to glass. The hardware-decoded app is far below that; in use it feels
-immediate.
+Measured with the probes in `pc/` (a square flips on the PC, the tablet reports when it has decoded it): the app
+takes **89 ms** median (85-100 ms) from the change on the PC to the decoded frame on the tablet, plus at most one
+screen refresh to show it. The Linux-mode software decoder takes about 335 ms. To repeat it: create
+`/sdcard/rosetta/probe` on the tablet, restart the app and run `python pc/latency_probe.py`.
 
 ## Risks and Recovery
 

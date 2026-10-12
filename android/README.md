@@ -1,10 +1,11 @@
 # Rosetta Screen (Android app)
 
 The tablet as a wireless pen display for your PC, plus the boot menu (*Wireless screen / Linux desktop / Android*).
-Android 4.1+ (the Hybrid runs 4.2.1), about 20 KB, no libraries.
+Android 4.1+ (the Hybrid runs 4.2.1), about 25 KB, no libraries.
 
 * `ScreenActivity` - receives AES-encrypted H.264 frames, hardware-decodes them (MediaCodec) into an overlay window
   above the system bar, and sends pen / touch / keys back as HMAC-signed UDP packets.
+* `Keys` - the tablet's own keyboard for the PC (Menu key, or popped up by the PC when a text box gets the focus).
 * `ChooserActivity` + `BootReceiver` - the boot menu shown at every power-on.
 
 Config: `/sdcard/rosetta/pc.conf`, written by `pc/pair.py` (host, ports, the shared secret, optional `remote=`).
