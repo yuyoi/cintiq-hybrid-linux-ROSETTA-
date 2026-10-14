@@ -4,6 +4,8 @@ Packet (little endian), followed by an 8-byte truncated HMAC-SHA256 tag over the
   'P' seq:u32 flags:u8 x:u16 y:u16 pressure:u16 tiltx:i8 tilty:i8
        flags: bit0 in-range, bit1 contact, bit2 barrel button, bit3 eraser
        x,y: 0..65535 across the mapped region; pressure 0..1023; tilt -90..90 degrees
+  'T' seq:u32 down:u8 x:u16 y:u16                         one finger
+  'M' seq:u32 n:u8 then n x (id:u8 x:u16 y:u16)           every finger that is down (none = all lifted)
   'K' seq:u32 action:24 bytes (utf-8, NUL padded), e.g. 'ctrl+z'
 
 Only datagrams from ALLOW_IP with a valid tag and a rising sequence number are accepted.
@@ -183,6 +185,8 @@ class Pen:
         self.in_range = False
         self.contact = False
         self.frame = 0
+        self.barrel = False
+        self.tool = None
 
     def inject(self, flags, penflags, x, y, pressure, tx, ty):
         pi = POINTER_TYPE_INFO()
@@ -206,8 +210,18 @@ class Pen:
     def update(self, inrange, contact, barrel, eraser, nx, ny, pressure, tx, ty):
         x = self.rx + int(nx / 65535.0 * (self.rw - 1))
         y = self.ry + int(ny / 65535.0 * (self.rh - 1))
-        pf = (PEN_BARREL if barrel else 0) | ((PEN_INVERTED | PEN_ERASER) if eraser else 0)
+        # eraser end: "inverted" while hovering, "inverted + eraser" while touching (what Windows Ink apps look for)
+        pf = (PEN_INVERTED | (PEN_ERASER if contact else 0)) if eraser else 0
         pressure = min(1024, pressure)
+        tool = 'eraser' if eraser else 'tip'
+        if inrange and tool != self.tool:
+            print('pen tool:', tool, flush=True); self.tool = tool
+        want = barrel and inrange
+        if want != self.barrel:
+            # side button = right mouse button, like the Wacom driver (held = held, so right-drag works too);
+            # the cursor is already where the pen is
+            user32.mouse_event(0x0008 if want else 0x0010, 0, 0, 0, 0)            # RIGHTDOWN / RIGHTUP
+            self.barrel = want
         if inrange and not self.in_range:
             self.inject(F_NEW | F_INRANGE | F_UPDATE, pf, x, y, 0, tx, ty); self.in_range = True
         if not inrange:
@@ -228,41 +242,53 @@ class Pen:
 
 
 class Touch:
-    """One finger from the tablet as a real Windows touch contact (tap = click, drag = drag/scroll)."""
+    """The tablet's fingers as real Windows touch contacts, up to 10 at once: tap = click, drag, pinch zoom,
+    two-finger pan / rotate. Every frame names all fingers that are down, so a lost packet costs nothing."""
+    MAX = 10
+
     def __init__(self, region):
-        self.dev = user32.CreateSyntheticPointerDevice(PT_TOUCH, 1, POINTER_FEEDBACK_DEFAULT)
+        self.dev = user32.CreateSyntheticPointerDevice(PT_TOUCH, self.MAX, POINTER_FEEDBACK_DEFAULT)
         if not self.dev:
             raise OSError('CreateSyntheticPointerDevice(touch) failed: %d' % ctypes.get_last_error())
         self.rx, self.ry, self.rw, self.rh = region
-        self.contact = False; self.frame = 0; self.x = self.y = 0; self.last = 0.0
+        self.down = {}                 # finger id -> (x, y) screen pixels
+        self.primary = None            # the gesture's first finger
+        self.frame = 0; self.last = 0.0
 
-    def inject(self, flags):
-        pi = POINTER_TYPE_INFO(); pi.type = PT_TOUCH
-        t = pi.touchInfo
-        t.pointerInfo.pointerType = PT_TOUCH; t.pointerInfo.pointerId = 0
-        self.frame += 1; t.pointerInfo.frameId = self.frame
-        t.pointerInfo.pointerFlags = flags
-        t.pointerInfo.ptPixelLocation.x = self.x; t.pointerInfo.ptPixelLocation.y = self.y
-        t.touchMask = TOUCH_MASK_CONTACTAREA
-        t.rcContact.left, t.rcContact.top, t.rcContact.right, t.rcContact.bottom = self.x - 4, self.y - 4, self.x + 4, self.y + 4
-        if not user32.InjectSyntheticPointerInput(self.dev, ctypes.byref(pi), 1):
+    def inject(self, items):
+        arr = (POINTER_TYPE_INFO * len(items))()
+        self.frame += 1
+        for pi, (pid, x, y, fl) in zip(arr, items):
+            pi.type = PT_TOUCH
+            t = pi.touchInfo
+            t.pointerInfo.pointerType = PT_TOUCH; t.pointerInfo.pointerId = pid; t.pointerInfo.frameId = self.frame
+            t.pointerInfo.pointerFlags = fl | (F_PRIMARY if pid == self.primary else 0)
+            t.pointerInfo.ptPixelLocation.x = x; t.pointerInfo.ptPixelLocation.y = y
+            t.touchMask = TOUCH_MASK_CONTACTAREA
+            t.rcContact.left, t.rcContact.top, t.rcContact.right, t.rcContact.bottom = x - 4, y - 4, x + 4, y + 4
+        if not user32.InjectSyntheticPointerInput(self.dev, arr, len(items)):
             print('touch inject failed', ctypes.get_last_error(), file=sys.stderr)
         self.last = time.monotonic()
 
-    def update(self, down, nx, ny):
-        self.x = self.rx + int(nx / 65535.0 * (self.rw - 1)); self.y = self.ry + int(ny / 65535.0 * (self.rh - 1))
-        if down and not self.contact:
-            self.inject(F_DOWN | F_INRANGE | F_INCONTACT | F_PRIMARY); self.contact = True
-            TAP[:] = [time.monotonic(), self.x, self.y]
-        elif down:
-            self.inject(F_UPDATE | F_INRANGE | F_INCONTACT | F_PRIMARY)
-        elif self.contact:
-            self.inject(F_UP | F_PRIMARY); self.contact = False
+    def update(self, contacts):
+        """contacts: {finger id: (nx, ny)} for every finger down right now (0..65535 across the picture)."""
+        now = {pid: (self.rx + int(nx / 65535.0 * (self.rw - 1)), self.ry + int(ny / 65535.0 * (self.rh - 1)))
+               for pid, (nx, ny) in contacts.items() if pid < self.MAX}
+        if now and not self.down:
+            self.primary = min(now)
+            TAP[:] = [time.monotonic()] + list(now[self.primary])
+        items = [(pid, x, y, (F_UPDATE if pid in self.down else F_DOWN) | F_INRANGE | F_INCONTACT) for pid, (x, y) in now.items()]
+        items += [(pid, x, y, F_UP) for pid, (x, y) in self.down.items() if pid not in now]
+        if items:
+            self.inject(items)
+        self.down = now
+        if not now:
+            self.primary = None
 
     def keepalive(self):
-        # Windows cancels a touch contact that stops reporting, so a finger resting still is re-sent
-        if self.contact and time.monotonic() - self.last > 0.05:
-            self.inject(F_UPDATE | F_INRANGE | F_INCONTACT | F_PRIMARY)
+        # Windows cancels a touch contact that stops reporting, so fingers resting still are re-sent
+        if self.down and time.monotonic() - self.last > 0.05:
+            self.inject([(pid, x, y, F_UPDATE | F_INRANGE | F_INCONTACT) for pid, (x, y) in self.down.items()])
 
 
 PEN_UNTIL = [0.0]        # monotonic time until which the pen "owns" the cursor
@@ -379,7 +405,7 @@ def main():
             data, addr = s.recvfrom(512)
         except socket.timeout:
             touch.keepalive(); continue
-        if (a.allow != 'any' and addr[0] != a.allow) or len(data) < 9 + 8:   # 'any': the HMAC tag is the gate
+        if (a.allow != 'any' and addr[0] != a.allow) or len(data) < 6 + 8:   # 'any': the HMAC tag is the gate
             continue
         payload, tag = data[:-8], data[-8:]
         if not hmac.compare_digest(hmac.new(secret, payload, hashlib.sha256).digest()[:8], tag):
@@ -395,10 +421,15 @@ def main():
             pen.update(bool(flags & 1), bool(flags & 2), bool(flags & 4), bool(flags & 8), x, y, pr, tx, ty)
             stats[0] += 1
             PEN_UNTIL[0] = time.monotonic() + a.hold
-        elif kind == b'T' and len(payload) >= 10:
+        elif kind == b'T' and len(payload) >= 10:              # one finger (the Linux bridge)
             down, x, y = struct.unpack_from('<BHH', payload, 5)
-            touch.update(bool(down & 1), x, y)
+            touch.update({0: (x, y)} if down & 1 else {})
             PEN_UNTIL[0] = time.monotonic() + a.hold          # a finger on the tablet also keeps the PC mouse out
+            stats[0] += 1
+        elif kind == b'M' and len(payload) >= 6:               # all fingers (the Android app)
+            n = min(payload[5], (len(payload) - 6) // 5)
+            touch.update({payload[6 + 5 * i]: struct.unpack_from('<HH', payload, 7 + 5 * i) for i in range(n)})
+            PEN_UNTIL[0] = time.monotonic() + a.hold
             stats[0] += 1
         elif kind == b'K':
             act = payload[5:29].split(b'\0')[0].decode('utf-8', 'ignore')

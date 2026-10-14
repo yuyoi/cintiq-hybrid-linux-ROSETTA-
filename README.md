@@ -54,15 +54,19 @@ can never get stuck.
    screen to **1920 x 1080** and *Extend these displays*.
 4. Run **`pc/start_rosetta_screen.bat`**, then pick **WIRELESS SCREEN** on the tablet.
 
-The pen draws on that screen, with pressure. Fingers tap, drag and scroll (ignored while the pen is near, so you can
-rest your hand).
+The pen draws on that screen, with pressure; its side button is the right mouse button (hold it to right-drag).
+Fingers are real Windows multitouch: tap, drag, pinch to zoom, two fingers to pan. A quick **two-finger tap is undo**.
+Fingers are ignored while the pen is near, so you can rest your hand.
 
 | Tablet button | In the wireless screen |
 |---|---|
 | Search | switch between **extending** (the second screen) and **mirroring** your main screen; pen and touch follow |
 | Menu | the tablet's keyboard on / off |
 | Volume + / − | undo / redo |
-| Back | exit |
+| Back | **hold** to leave (a quick press only shows a hint, so it can't close the screen by accident) |
+
+The screen stays up whatever Android does underneath: on the Hybrid, Android's hidden bottom bar still catches a tap
+on its Home spot (bottom centre, where the Windows taskbar is), and that no longer closes the wireless screen.
 
 **Keyboard:** tap a text box on the PC with a finger or the pen and the tablet's own keyboard pops up (æ ø å,
 symbols, arrows, Ctrl and Shift, Shift twice for caps lock). If the keyboard would cover the box, the picture slides

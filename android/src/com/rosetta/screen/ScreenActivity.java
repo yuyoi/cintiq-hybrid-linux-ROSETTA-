@@ -72,8 +72,8 @@ public class ScreenActivity extends Activity implements SurfaceHolder.Callback {
     volatile int fps, dropped, frameCount;
 
     long lastPen;
-    boolean touchDown;
-    float lastTx, lastTy;
+    volatile String hint;                          // a short note in the status line ("hold Back to leave")
+    volatile long hintUntil;
 
     Keys keys;                                     // the tablet's own keyboard for the PC
     boolean kbTouch;                               // the current touch started on the keyboard
@@ -135,15 +135,19 @@ public class ScreenActivity extends Activity implements SurfaceHolder.Callback {
                 PixelFormat.OPAQUE);
         lp.gravity = Gravity.TOP | Gravity.LEFT;
         lp.x = 0; lp.y = 0;
-        try { getWindowManager().addView(root, lp); shown = true; root.requestFocus(); }
+        // Added through the application's window manager, not the activity's: the activity's would tie the overlay to
+        // the activity, and Android hides it the moment anything (a Home press from its bar) sends the activity back.
+        try { appWm().addView(root, lp); shown = true; root.requestFocus(); }
         catch (Exception e) { info = "overlay refused (" + e + ")"; setContentView(root); shown = false; }
     }
 
     void hideOverlay() {
         if (!shown) return;
-        try { getWindowManager().removeView(root); } catch (Exception ignored) { }
+        try { appWm().removeView(root); } catch (Exception ignored) { }
         shown = false;
     }
+
+    WindowManager appWm() { return (WindowManager) getApplicationContext().getSystemService(Context.WINDOW_SERVICE); }
 
     // ------------------------------------------------------------------ keyboard
     // Shown by the Menu key, or by the PC when a tap from here puts its focus in a text box. bottom = that box's lower
@@ -230,10 +234,19 @@ public class ScreenActivity extends Activity implements SurfaceHolder.Callback {
         showOverlay();
     }
 
+    // The overlay stays up while Android does anything underneath (a tap that lands on its hidden Back / Recents
+    // buttons, a notification): only holding Back closes the screen.
     @Override
-    protected void onPause() {
+    protected void onDestroy() {
         hideOverlay();
-        super.onPause();
+        super.onDestroy();
+    }
+
+    void hint(String s) {
+        hint = s;
+        hintUntil = SystemClock.uptimeMillis() + 2000;
+        status.setText(s);
+        status.setVisibility(View.VISIBLE);
     }
 
     // ------------------------------------------------------------------ packets to the PC
@@ -272,11 +285,14 @@ public class ScreenActivity extends Activity implements SurfaceHolder.Callback {
         send(bb, port);
     }
 
-    void sendTouch(boolean down, float x, float y) {
-        ByteBuffer bb = pkt('T', 12);
-        bb.put((byte) (down ? 1 : 0)).putShort((short) norm(x, view.getWidth())).putShort((short) norm(y + pan, view.getHeight()));
+    void sendFingers() {                                            // every finger that is down ('M'), none = all lifted
+        int n = 0;
+        for (boolean d : fdown) if (d) n++;
+        ByteBuffer bb = pkt('M', 6 + 5 * n);
+        bb.put((byte) n);
+        for (int id = 0; id < 10; id++)
+            if (fdown[id]) bb.put((byte) id).putShort((short) norm(fx[id], view.getWidth())).putShort((short) norm(fy[id] + pan, view.getHeight()));
         send(bb, port);
-        lastTx = x; lastTy = y;
     }
 
     void sendKey(String action) {
@@ -305,9 +321,10 @@ public class ScreenActivity extends Activity implements SurfaceHolder.Callback {
                                                                       // started on the picture still ends on the PC)
         if (tool == MotionEvent.TOOL_TYPE_STYLUS || tool == MotionEvent.TOOL_TYPE_ERASER) {
             lastPen = SystemClock.uptimeMillis();
-            if (touchDown) { sendTouch(false, lastTx, lastTy); touchDown = false; }
+            if (tState == LIVE) { Arrays.fill(fdown, false); sendFingers(); }       // the pen takes over from the hand
+            if (tState != IDLE) { root.removeCallbacks(goLive); tState = IGNORE; }
             boolean eraser = tool == MotionEvent.TOOL_TYPE_ERASER;
-            boolean barrel = (e.getButtonState() & MotionEvent.BUTTON_SECONDARY) != 0;
+            boolean barrel = (e.getButtonState() & (MotionEvent.BUTTON_SECONDARY | MotionEvent.BUTTON_TERTIARY)) != 0;
             boolean contact = touchStream && (act == MotionEvent.ACTION_DOWN || act == MotionEvent.ACTION_MOVE
                     || act == MotionEvent.ACTION_POINTER_DOWN);
             boolean inRange = act != MotionEvent.ACTION_HOVER_EXIT && act != MotionEvent.ACTION_CANCEL;
@@ -315,18 +332,83 @@ public class ScreenActivity extends Activity implements SurfaceHolder.Callback {
                 sendPen(inRange, contact, barrel, eraser, e.getHistoricalX(0, i), e.getHistoricalY(0, i), e.getHistoricalPressure(0, i));
             sendPen(inRange, contact, barrel, eraser, e.getX(0), e.getY(0), e.getPressure(0));
         } else if (touchStream && tool == MotionEvent.TOOL_TYPE_FINGER) {
-            if (SystemClock.uptimeMillis() - lastPen < 400) return;   // palm rejection: the pen was just here
-            boolean down = act != MotionEvent.ACTION_UP && act != MotionEvent.ACTION_CANCEL;
-            if (down || touchDown) sendTouch(down, e.getX(0), e.getY(0));
-            touchDown = down;
+            fingers(e);
         }
+    }
+
+    // ------------------------------------------------------------------ fingers
+    // Every finger goes to Windows as a real touch contact (pinch zoom, two-finger pan). A quick two-finger tap is undo
+    // instead, so that it can't click too, a new touch waits ~0.1 s (0.26 s once a second finger lands) before it goes
+    // out; a touch that moves goes out at once.
+    static final int IDLE = 0, WAIT = 1, LIVE = 2, IGNORE = 3;
+    int tState = IDLE;
+    long tDown;
+    int most;                                                        // most fingers down at once in this touch
+    final float[] fx = new float[10], fy = new float[10], sx = new float[10], sy = new float[10];
+    final boolean[] fdown = new boolean[10];
+    final Runnable goLive = new Runnable() { public void run() {
+        if (tState != WAIT) return;
+        long age = SystemClock.uptimeMillis() - tDown;
+        if (most >= 2 && age < 260) { root.postDelayed(this, 260 - age); return; }
+        tState = LIVE;                                               // held still: it's a press / pinch, send it
+        sendFingers();
+    } };
+
+    void fingers(MotionEvent e) {
+        int act = e.getActionMasked();
+        long now = SystemClock.uptimeMillis();
+        if (act == MotionEvent.ACTION_DOWN) {
+            Arrays.fill(fdown, false);
+            most = 0;
+            tDown = now;
+            tState = now - lastPen < 400 ? IGNORE : WAIT;            // palm rejection: the pen was just here
+            if (tState == WAIT) root.postDelayed(goLive, 110);
+        }
+        if (tState == IGNORE || tState == IDLE) return;
+        for (int i = 0; i < e.getPointerCount(); i++) {
+            int id = e.getPointerId(i);
+            if (id >= 10) continue;
+            fx[id] = e.getX(i);
+            fy[id] = e.getY(i);
+            if (!fdown[id]) { fdown[id] = true; sx[id] = fx[id]; sy[id] = fy[id]; }
+        }
+        boolean end = act == MotionEvent.ACTION_UP || act == MotionEvent.ACTION_CANCEL;
+        if (act == MotionEvent.ACTION_POINTER_UP) {
+            int id = e.getPointerId(e.getActionIndex());
+            if (id < 10) fdown[id] = false;
+        }
+        int n = 0;
+        for (boolean d : fdown) if (d) n++;
+        most = Math.max(most, n);
+        if (tState == WAIT) {
+            if (end) {                                               // lifted before anything went out: a tap
+                root.removeCallbacks(goLive);
+                tState = IDLE;
+                if (most == 2 && now - tDown < 300) { sendKey("ctrl+z"); return; }   // two-finger tap = undo
+                if (most == 1) { sendFingers(); Arrays.fill(fdown, false); sendFingers(); }   // one finger = a click
+                Arrays.fill(fdown, false);
+                return;
+            }
+            boolean moved = false;
+            for (int id = 0; id < 10; id++)
+                if (fdown[id] && Math.hypot(fx[id] - sx[id], fy[id] - sy[id]) > 24) moved = true;
+            if (!moved) return;
+            root.removeCallbacks(goLive);
+            tState = LIVE;
+        }
+        if (end) Arrays.fill(fdown, false);
+        sendFingers();
+        if (end) tState = IDLE;
     }
 
     @Override
     public boolean onKeyDown(int code, KeyEvent e) {
         String a = null;
         switch (code) {
-            case KeyEvent.KEYCODE_BACK: finish(); return true;
+            case KeyEvent.KEYCODE_BACK:                                        // held = leave; a tap can't close it
+                if (e.getRepeatCount() == 0) hint("hold Back to leave the wireless screen");
+                else if (e.getEventTime() - e.getDownTime() > 800) finish();
+                return true;
             case KeyEvent.KEYCODE_VOLUME_UP: a = "ctrl+z"; break;
             case KeyEvent.KEYCODE_VOLUME_DOWN: a = "ctrl+shift+z"; break;
             case KeyEvent.KEYCODE_MENU:                                        // the tablet keyboard on / off
@@ -342,7 +424,7 @@ public class ScreenActivity extends Activity implements SurfaceHolder.Callback {
     @Override
     public boolean onKeyUp(int code, KeyEvent e) {
         if (code == KeyEvent.KEYCODE_VOLUME_UP || code == KeyEvent.KEYCODE_VOLUME_DOWN || code == KeyEvent.KEYCODE_MENU
-                || code == KeyEvent.KEYCODE_SEARCH) return true;
+                || code == KeyEvent.KEYCODE_SEARCH || code == KeyEvent.KEYCODE_BACK) return true;
         return super.onKeyUp(code, e);
     }
 
@@ -381,8 +463,9 @@ public class ScreenActivity extends Activity implements SurfaceHolder.Callback {
                 sendFrom(v, pkt('H', 8), bcast, port + 1);
                 if (remoteAddr != null) sendFrom(v, pkt('H', 8), remoteAddr, port + 1);
             }
-            final String s = info + (fps > 0 ? "   " + fps + " fps" + (dropped > 0 ? "  dropped " + dropped : "") : "");
-            final boolean hide = fps > 0 && dropped == 0;
+            boolean hinting = SystemClock.uptimeMillis() < hintUntil;
+            final String s = hinting ? hint : info + (fps > 0 ? "   " + fps + " fps" + (dropped > 0 ? "  dropped " + dropped : "") : "");
+            final boolean hide = fps > 0 && dropped == 0 && !hinting;
             runOnUiThread(new Runnable() { public void run() {
                 status.setText(s);
                 status.setVisibility(hide ? View.GONE : View.VISIBLE);
