@@ -70,8 +70,14 @@ public class ScreenActivity extends Activity implements SurfaceHolder.Callback {
     Thread videoThread, helloThread;
     volatile String info = "starting";
     volatile int fps, dropped, frameCount;
+    // Falling behind: the PC's answer to our hello queues behind the video in the same socket, so its round trip is how
+    // far behind live we are. Past 0.4 s the queued backlog is thrown away and we jump back to live.
+    volatile long helloAt, rtt, flushes;
+    volatile boolean flush;
+    long diagAt;
 
     long lastPen;
+    boolean button2;                               // the pen's upper side button (the PC makes it deselect)
     volatile String hint;                          // a short note in the status line ("hold Back to leave")
     volatile long hintUntil;
 
@@ -277,7 +283,7 @@ public class ScreenActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     void sendPen(boolean inRange, boolean contact, boolean barrel, boolean eraser, float x, float y, float pressure) {
-        int flags = (inRange ? 1 : 0) | (contact ? 2 : 0) | (barrel ? 4 : 0) | (eraser ? 8 : 0);
+        int flags = (inRange ? 1 : 0) | (contact ? 2 : 0) | (barrel ? 4 : 0) | (eraser ? 8 : 0) | (button2 ? 16 : 0);
         int press = contact ? Math.max(1, Math.min(1023, (int) (pressure * 1023))) : 0;
         ByteBuffer bb = pkt('P', 16);
         bb.put((byte) flags).putShort((short) norm(x, view.getWidth())).putShort((short) norm(y + pan, view.getHeight()))
@@ -324,7 +330,8 @@ public class ScreenActivity extends Activity implements SurfaceHolder.Callback {
             if (tState == LIVE) { Arrays.fill(fdown, false); sendFingers(); }       // the pen takes over from the hand
             if (tState != IDLE) { root.removeCallbacks(goLive); tState = IGNORE; }
             boolean eraser = tool == MotionEvent.TOOL_TYPE_ERASER;
-            boolean barrel = (e.getButtonState() & (MotionEvent.BUTTON_SECONDARY | MotionEvent.BUTTON_TERTIARY)) != 0;
+            boolean barrel = (e.getButtonState() & MotionEvent.BUTTON_SECONDARY) != 0;      // lower side button
+            button2 = (e.getButtonState() & MotionEvent.BUTTON_TERTIARY) != 0;             // upper side button
             boolean contact = touchStream && (act == MotionEvent.ACTION_DOWN || act == MotionEvent.ACTION_MOVE
                     || act == MotionEvent.ACTION_POINTER_DOWN);
             boolean inRange = act != MotionEvent.ACTION_HOVER_EXIT && act != MotionEvent.ACTION_CANCEL;
@@ -459,6 +466,8 @@ public class ScreenActivity extends Activity implements SurfaceHolder.Callback {
             }
             DatagramSocket v = vsock;
             if (v != null) {
+                if (helloAt != 0 && SystemClock.uptimeMillis() - helloAt > 10000) helloAt = 0;   // PC was gone: start over
+                if (helloAt == 0) helloAt = SystemClock.uptimeMillis();
                 sendFrom(v, pkt('H', 8), pc, port + 1);
                 sendFrom(v, pkt('H', 8), bcast, port + 1);
                 if (remoteAddr != null) sendFrom(v, pkt('H', 8), remoteAddr, port + 1);
@@ -470,9 +479,31 @@ public class ScreenActivity extends Activity implements SurfaceHolder.Callback {
                 status.setText(s);
                 status.setVisibility(hide ? View.GONE : View.VISIBLE);
             } });
+            if (SystemClock.uptimeMillis() - diagAt > 10000) { diagAt = SystemClock.uptimeMillis(); diag(); }
             fps = frameCount; frameCount = 0; dropped = 0;
             SystemClock.sleep(1000);
         }
+    }
+
+    static String sys(String path) {
+        try { BufferedReader r = new BufferedReader(new FileReader(path)); String s = r.readLine(); r.close(); return s == null ? "?" : s.trim(); }
+        catch (Exception e) { return "?"; }
+    }
+
+    /** Every 10 s one line in /sdcard/rosetta/diag.txt (kept under ~200 KB): what to look at if it ever gets slow. */
+    void diag() {
+        try {
+            File f = new File(Environment.getExternalStorageDirectory(), "rosetta/diag.txt");
+            boolean append = f.length() < 200000;
+            Runtime rt = Runtime.getRuntime();
+            java.io.FileWriter w = new java.io.FileWriter(f, append);
+            w.write(new java.text.SimpleDateFormat("HH:mm:ss").format(new java.util.Date())
+                    + " fps=" + fps + " dropped=" + dropped + " behind_ms=" + rtt + " flushes=" + flushes
+                    + " cpu_khz=" + sys("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq")
+                    + " temp=" + sys("/sys/class/thermal/thermal_zone0/temp")
+                    + " heap_kb=" + (rt.totalMemory() - rt.freeMemory()) / 1024 + "\n");
+            w.close();
+        } catch (Exception ignored) { }
     }
 
     boolean signed(byte[] b, int n) {                              // the PC's HMAC tag (last 8 bytes) is right
@@ -533,10 +564,28 @@ public class ScreenActivity extends Activity implements SurfaceHolder.Callback {
             byte[] session = new byte[6], iv = new byte[16];
             DatagramPacket dp = new DatagramPacket(buf, buf.length);
             while (running) {
+                if (flush) {                                                    // behind live: drop the backlog
+                    flush = false;
+                    flushes++;
+                    long end = SystemClock.uptimeMillis() + 300;
+                    in.setSoTimeout(1);
+                    try { while (SystemClock.uptimeMillis() < end) in.receive(dp); } catch (SocketTimeoutException t) { }
+                    in.setSoTimeout(5);
+                    cur = -1; done = true;                                      // pick up at the next frame
+                    final long was = rtt;
+                    runOnUiThread(new Runnable() { public void run() { hint("caught up (was " + was + " ms behind)"); } });
+                }
                 boolean have = false;
                 try { in.receive(dp); have = true; } catch (SocketTimeoutException t) { }
                 if (have && dp.getLength() >= 13 && buf[0] == 'A') {               // the PC answering our hello
-                    if (signed(buf, dp.getLength()) && !dp.getAddress().equals(pc)) { pc = dp.getAddress(); host = pc.getHostAddress(); info = "PC " + host + "  hardware decoder"; }
+                    if (signed(buf, dp.getLength())) {
+                        if (helloAt != 0) {
+                            rtt = SystemClock.uptimeMillis() - helloAt;
+                            helloAt = 0;
+                            if (rtt > 400) { flush = true; sendKey("lag"); }      // the PC goes quiet to a keyframe
+                        }
+                        if (!dp.getAddress().equals(pc)) { pc = dp.getAddress(); host = pc.getHostAddress(); info = "PC " + host + "  hardware decoder"; }
+                    }
                     continue;
                 }
                 if (have && dp.getLength() == 17 && buf[0] == 'C' && signed(buf, 17)) {   // the PC: keyboard up / down

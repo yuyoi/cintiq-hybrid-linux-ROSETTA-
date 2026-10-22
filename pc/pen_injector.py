@@ -2,7 +2,7 @@
 
 Packet (little endian), followed by an 8-byte truncated HMAC-SHA256 tag over the payload:
   'P' seq:u32 flags:u8 x:u16 y:u16 pressure:u16 tiltx:i8 tilty:i8
-       flags: bit0 in-range, bit1 contact, bit2 barrel button, bit3 eraser
+       flags: bit0 in-range, bit1 contact, bit2 barrel button, bit3 eraser, bit4 second side button
        x,y: 0..65535 across the mapped region; pressure 0..1023; tilt -90..90 degrees
   'T' seq:u32 down:u8 x:u16 y:u16                         one finger
   'M' seq:u32 n:u8 then n x (id:u8 x:u16 y:u16)           every finger that is down (none = all lifted)
@@ -176,6 +176,24 @@ class FocusWatch:
             self.changed += 1
 
 
+def foreground_exe():
+    """File name of the program owning the active window, lower case ('krita.exe'), or ''."""
+    k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    user32.GetForegroundWindow.restype = ctypes.c_void_p
+    pid = wt.DWORD()
+    user32.GetWindowThreadProcessId(ctypes.c_void_p(user32.GetForegroundWindow()), ctypes.byref(pid))
+    k32.OpenProcess.restype = ctypes.c_void_p
+    h = k32.OpenProcess(0x1000, False, pid.value)                     # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return ''
+    try:
+        buf = ctypes.create_unicode_buffer(520); n = wt.DWORD(520)
+        ok = k32.QueryFullProcessImageNameW(ctypes.c_void_p(h), 0, buf, ctypes.byref(n))
+        return os.path.basename(buf.value).lower() if ok else ''
+    finally:
+        k32.CloseHandle(ctypes.c_void_p(h))
+
+
 class Pen:
     def __init__(self, region):
         self.dev = user32.CreateSyntheticPointerDevice(PT_PEN, 1, POINTER_FEEDBACK_DEFAULT)
@@ -186,14 +204,17 @@ class Pen:
         self.contact = False
         self.frame = 0
         self.barrel = False
+        self.button2 = False
         self.tool = None
+        self.krita_eraser = False
+        self.pid = 0                   # tip = pointer 0, eraser end = pointer 1 (apps fix a pointer's type when they first see it)
 
     def inject(self, flags, penflags, x, y, pressure, tx, ty):
         pi = POINTER_TYPE_INFO()
         pi.type = PT_PEN
         p = pi.penInfo
         p.pointerInfo.pointerType = PT_PEN
-        p.pointerInfo.pointerId = 0
+        p.pointerInfo.pointerId = self.pid
         self.frame += 1
         p.pointerInfo.frameId = self.frame
         p.pointerInfo.pointerFlags = flags
@@ -207,7 +228,7 @@ class Pen:
         if not user32.InjectSyntheticPointerInput(self.dev, ctypes.byref(pi), 1):
             print('inject failed', ctypes.get_last_error(), file=sys.stderr)
 
-    def update(self, inrange, contact, barrel, eraser, nx, ny, pressure, tx, ty):
+    def update(self, inrange, contact, barrel, eraser, nx, ny, pressure, tx, ty, button2=False):
         x = self.rx + int(nx / 65535.0 * (self.rw - 1))
         y = self.ry + int(ny / 65535.0 * (self.rh - 1))
         # eraser end: "inverted" while hovering, "inverted + eraser" while touching (what Windows Ink apps look for)
@@ -216,6 +237,23 @@ class Pen:
         tool = 'eraser' if eraser else 'tip'
         if inrange and tool != self.tool:
             print('pen tool:', tool, flush=True); self.tool = tool
+            if self.in_range:                                   # flipped without leaving range: end the old pointer
+                if self.contact:
+                    self.inject(F_UP | F_INRANGE, 0, x, y, 0, tx, ty); self.contact = False
+                self.inject(F_UPDATE, 0, x, y, 0, tx, ty); self.in_range = False
+            self.pid = 1 if eraser else 0
+            # Krita ignores the eraser flag from injected pens, so the eraser end flips Krita's eraser mode (E) on, and
+            # the tip flips it back off; only while Krita is the active window, and only if we were the one turning it on
+            if eraser and foreground_exe() == 'krita.exe':
+                send_keys('e'); self.krita_eraser = True
+            elif not eraser and self.krita_eraser:
+                if foreground_exe() == 'krita.exe':
+                    send_keys('e')
+                self.krita_eraser = False
+        b2 = button2 and inrange
+        if b2 and not self.button2:                             # upper side button = deselect (Krita: Ctrl+Shift+A)
+            send_keys('ctrl+shift+a')
+        self.button2 = b2
         want = barrel and inrange
         if want != self.barrel:
             # side button = right mouse button, like the Wacom driver (held = held, so right-drag works too);
@@ -418,7 +456,7 @@ def main():
         kind = payload[:1]
         if kind == b'P' and len(payload) >= 14:
             flags, x, y, pr, tx, ty = struct.unpack_from('<BHHHbb', payload, 5)
-            pen.update(bool(flags & 1), bool(flags & 2), bool(flags & 4), bool(flags & 8), x, y, pr, tx, ty)
+            pen.update(bool(flags & 1), bool(flags & 2), bool(flags & 4), bool(flags & 8), x, y, pr, tx, ty, bool(flags & 16))
             stats[0] += 1
             PEN_UNTIL[0] = time.monotonic() + a.hold
         elif kind == b'T' and len(payload) >= 10:              # one finger (the Linux bridge)
@@ -433,9 +471,11 @@ def main():
             stats[0] += 1
         elif kind == b'K':
             act = payload[5:29].split(b'\0')[0].decode('utf-8', 'ignore')
-            if not act.startswith('u:'):                       # typed text is never logged (passwords)
+            if not act.startswith('u:') and act != 'lag':      # typed text is never logged (passwords)
                 print('key', act, flush=True)
-            if act == 'screen':                                 # pen + touch follow; the streamer switches the picture
+            if act == 'lag':                                   # the app is behind live: the streamer pauses to a keyframe
+                ctl.sendto(b'lag', ('127.0.0.1', a.port + 2))
+            elif act == 'screen':                                 # pen + touch follow; the streamer switches the picture
                 mode = other_monitor(mode)
                 pen.rx, pen.ry, pen.rw, pen.rh = touch.rx, touch.ry, touch.rw, touch.rh = region_for(mode)
                 ctl.sendto(('screen ' + mode).encode(), ('127.0.0.1', a.port + 2))

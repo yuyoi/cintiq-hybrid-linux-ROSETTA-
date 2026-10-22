@@ -1,6 +1,6 @@
 """Wireless Cintiq, PC side: starts the pen injector and streams your screen to the tablet. Ctrl+C stops both.
 
-    python wireless_cintiq.py --tablet-ip 192.168.1.220 [--res 1280x720] [--fps 30] [--bind <this PC's LAN ip>]
+    python wireless_cintiq.py --tablet-ip 192.168.1.50 [--res 1280x720] [--fps 30] [--bind <this PC's LAN ip>]
     python wireless_cintiq.py --client android [--monitor second]     (Rosetta Screen app, hardware decoding)
 
 On the tablet, tap PC on the taskbar (or press the Back button) to see this PC and draw on it with the pen.
@@ -91,9 +91,26 @@ class AndroidSender:
             except OSError:
                 pass
 
+    skip = False                       # the app fell behind: send nothing until the next keyframe
+
+    @staticmethod
+    def is_keyframe(frame):
+        i = frame.find(b'\x00\x00\x01')
+        while 0 <= i < len(frame) - 3:
+            if frame[i + 3] & 0x1f == 5:                               # an IDR slice
+                return True
+            i = frame.find(b'\x00\x00\x01', i + 3)
+        return False
+
     def send_frame(self, frame):
         if not self.target:
             return
+        # Wi-Fi slowed down and the router queued seconds of video: going quiet until the next keyframe (<= 1 s) lets
+        # that queue drain, and the picture comes back live and clean instead of staying behind
+        if self.skip:
+            if not self.is_keyframe(frame):
+                return
+            self.skip = False
         self.frame_id = (self.frame_id + 1) & 0xFFFFFFFF
         n = (len(frame) + self.MTU - 1) // self.MTU
         for i in range(n):
@@ -243,6 +260,9 @@ def main():
                 msg = ctl.recv(64).decode('ascii', 'ignore').split()
             except socket.timeout:
                 continue
+            if msg == ['lag'] and android and not sender.skip:          # the app is behind live
+                sender.skip = True
+                print(time.strftime('%H:%M:%S'), 'tablet behind: pausing to the next keyframe', flush=True)
             if len(msg) == 3 and msg[0] == 'kbd' and android:          # the injector saw a text box get / lose focus
                 sender.send_ctl(int(msg[1]), int(msg[2]))
             if len(msg) == 2 and msg[0] == 'screen':

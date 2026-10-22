@@ -54,7 +54,9 @@ can never get stuck.
    screen to **1920 x 1080** and *Extend these displays*.
 4. Run **`pc/start_rosetta_screen.bat`**, then pick **WIRELESS SCREEN** on the tablet.
 
-The pen draws on that screen, with pressure; its side button is the right mouse button (hold it to right-drag).
+The pen draws on that screen, with pressure. Lower side button = right mouse button (hold it to right-drag), upper
+side button = deselect (Ctrl+Shift+A). The eraser end erases: in Krita, which ignores the eraser flag of an injected
+pen, flipping the pen switches Krita's eraser mode (E) on and off for you.
 Fingers are real Windows multitouch: tap, drag, pinch to zoom, two fingers to pan. A quick **two-finger tap is undo**.
 Fingers are ignored while the pen is near, so you can rest your hand.
 
@@ -64,6 +66,11 @@ Fingers are ignored while the pen is near, so you can rest your hand.
 | Menu | the tablet's keyboard on / off |
 | Volume + / − | undo / redo |
 | Back | **hold** to leave (a quick press only shows a hint, so it can't close the screen by accident) |
+
+**Never falls behind:** when the Wi-Fi slows down for a moment, the router queues seconds of video. The app times
+the PC's answer to its hello (it waits in the same queue), and past 0.4 s it tells the PC, which sends nothing until
+the next keyframe (at most 1 s) so the queue drains, and the picture comes back live. Every 10 s the app logs frame
+rate, delay, CPU speed, temperature and memory to `/sdcard/rosetta/diag.txt`.
 
 The screen stays up whatever Android does underneath: on the Hybrid, Android's hidden bottom bar still catches a tap
 on its Home spot (bottom centre, where the Windows taskbar is), and that no longer closes the wireless screen.
