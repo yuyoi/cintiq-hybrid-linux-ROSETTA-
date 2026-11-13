@@ -87,6 +87,15 @@ Typed text is never logged.
 `pc/start_rosetta_remote.bat` (30 fps, 6 Mbit/s for home upload speeds). Public Wi-Fi that isolates devices can't
 work; a phone hotspot can.
 
+### Active cooling (optional hardware mod)
+
+The Tegra 4 has **no cooling at all** from the factory, so after ~20 minutes it throttles (612 MHz) and the wireless
+screen starts lagging. A heatsink plus a 5 V fan from the board's USB port keeps it at 52-55 °C and full clock for
+hours, with zero lag catch-ups. Photos, measurements, steps and a printable fan grille:
+**[docs/COOLING.md](docs/COOLING.md)**.
+
+<p align="center"><img src="docs/cooling/4_fan_on_back.jpg" width="320" alt="5 V fan mounted on the tablet's back plate"></p>
+
 ## The boot menu
 
 <p align="center"><b>WIRELESS SCREEN</b> &nbsp;·&nbsp; <b>LINUX DESKTOP</b> &nbsp;·&nbsp; <b>ANDROID</b></p>
